@@ -19,6 +19,11 @@ const {
     contactFormData = {},
     captchaApiKey = null,
     formSubmitTimeoutMs = 60000,
+    // mode: 'scrape' (default) = collect data; 'send' = only submit contact forms;
+    // 'both' = scrape then submit forms.
+    mode = 'scrape',
+    // Optional: supply explicit list of dealer base URLs to operate on instead of crawling
+    dealerUrls = [],
 } = input;
 
 /**
@@ -88,11 +93,18 @@ const listingCrawler = new CheerioCrawler({
     },
 });
 
-await listingCrawler.run([startUrl]);
+// Decide whether to crawl the listings or use provided `dealerUrls`.
+if (mode === 'scrape' || mode === 'both' || (mode === 'send' && (!dealerUrls || dealerUrls.length === 0))) {
+    await listingCrawler.run([startUrl]);
+    log.info(`Намерени ${dealerLinks.size} уникални дилъра в ${listingPagesVisited} страници от списъка.`);
+}
 
-log.info(`Намерени ${dealerLinks.size} уникални дилъра в ${listingPagesVisited} страници от списъка.`);
-
-let dealerEntries = [...dealerLinks.entries()]; // [ [url, name], ... ]
+let dealerEntries = [];
+if (dealerUrls && dealerUrls.length > 0) {
+    dealerEntries = dealerUrls.map((u) => [u.replace(/\/+$/, ''), null]);
+} else {
+    dealerEntries = [...dealerLinks.entries()]; // [ [url, name], ... ]
+}
 if (maxDealers > 0) {
     dealerEntries = dealerEntries.slice(0, maxDealers);
 }
@@ -179,14 +191,31 @@ const contactsCrawler = new CheerioCrawler({
     },
 });
 
-await contactsCrawler.run(
-    dealerEntries.map(([dealerUrl, listedName]) => ({
-        url: `${dealerUrl}/contacts`,
-        userData: { dealerUrl, listedName },
-    })),
-);
+if (mode === 'scrape' || mode === 'both') {
+    await contactsCrawler.run(
+        dealerEntries.map(([dealerUrl, listedName]) => ({
+            url: `${dealerUrl}/contacts`,
+            userData: { dealerUrl, listedName },
+        })),
+    );
 
-log.info(`Извлечени контакти за ${dealerResults.length} дилъра.`);
+    log.info(`Извлечени контакти за ${dealerResults.length} дилъра.`);
+} else {
+    // mode === 'send' and dealerEntries provided: prepare minimal dealerResults
+    dealerResults = dealerEntries.map(([dealerUrl, listedName]) => ({
+        dealerName: listedName || null,
+        dealerUrl,
+        contactsUrl: `${dealerUrl.replace(/\/+$/, '')}/contacts`,
+        phones: [],
+        address: null,
+        correspondenceAddress: null,
+        memberSince: null,
+        officialWebsite: null,
+        emails: [],
+        scrapedAt: new Date().toISOString(),
+    }));
+    log.info(`Подготвени ${dealerResults.length} дилъра за подадени съобщения (режим send).`);
+}
 
 /**
  * ---------------------------------------------------------------------------
@@ -349,6 +378,35 @@ async function solveRecaptcha2(sitekey, pageUrl, apiKey, timeoutMs = 120000) {
     throw new Error('2captcha timeout waiting for solution');
 }
 
+async function solveImageCaptcha2(imageBase64, apiKey, timeoutMs = 120000) {
+    if (!apiKey) throw new Error('No 2captcha API key provided');
+
+    const params = new URLSearchParams({
+        method: 'base64',
+        key: apiKey,
+        body: imageBase64,
+        json: '1',
+    });
+
+    const inRes = await fetch('http://2captcha.com/in.php', {
+        method: 'POST',
+        body: params,
+    });
+    const inJson = await inRes.json();
+    if (!inJson || inJson.status !== 1) throw new Error(`2captcha in.php error: ${JSON.stringify(inJson)}`);
+    const requestId = inJson.request;
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const res = await fetch(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${requestId}&json=1`);
+        const body = await res.json();
+        if (body.status === 1 && body.request) return body.request;
+        if (body.request && body.request.includes('ERROR')) throw new Error(`2captcha error: ${body.request}`);
+    }
+    throw new Error('2captcha timeout waiting for image solution');
+}
+
 async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
     const browser = await playwright.chromium.launch({ headless: true });
     const context = await browser.newContext();
@@ -412,7 +470,6 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             }
             try {
                 captchaToken = await solveRecaptcha2(sitekey, page.url(), captchaApiKeyLocal, Math.min(120000, timeoutMs));
-                // Inject token into textarea[name="g-recaptcha-response"]
                 await page.evaluate((token) => {
                     let textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
                     if (!textarea) {
@@ -426,6 +483,41 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             } catch (err) {
                 await browser.close();
                 return { submitted: false, reason: `captcha-solve-failed: ${err.message}` };
+            }
+        }
+
+        // Detect image-based captcha (simple distorted text image)
+        const imgHandle = await page.$('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
+        if (imgHandle) {
+            if (!captchaApiKeyLocal) {
+                await browser.close();
+                return { submitted: false, reason: 'image-captcha-present-no-api-key' };
+            }
+            try {
+                const src = await imgHandle.getAttribute('src');
+                const absolute = new URL(src, page.url()).toString();
+                const ab = await fetch(absolute).then((r) => r.arrayBuffer());
+                const base64 = Buffer.from(ab).toString('base64');
+                const solved = await solveImageCaptcha2(base64, captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                // Try to find input for the captcha code and fill it
+                const inputSelector = await page.$eval('input[name*="code"], input[name*="captcha"], input[placeholder*="код"], input[id*="code"], input[id*="captcha"]', (el) => el.getAttribute('name') || el.id || null).catch(() => null);
+                if (inputSelector) {
+                    // prefer name attribute selector if present
+                    const sel = inputSelector.includes(' ') || inputSelector.includes('#') ? `[name="${inputSelector}"]` : `input[name="${inputSelector}"]`;
+                    try { await page.fill(sel, solved.toString()); } catch {}
+                } else {
+                    // fallback: fill first input near the img
+                    await page.evaluate((val) => {
+                        const img = document.querySelector('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
+                        if (!img) return;
+                        // look for input sibling
+                        const input = img.parentElement.querySelector('input') || document.querySelector('input');
+                        if (input) input.value = val;
+                    }, solved.toString());
+                }
+            } catch (err) {
+                await browser.close();
+                return { submitted: false, reason: `image-captcha-solve-failed: ${err.message}` };
             }
         }
 
@@ -490,7 +582,7 @@ if (findOfficialWebsite && scrapeEmails) {
 // ---------------------------------------------------------------------------
 // Optional Phase: submit contact forms on the dealers' contact pages
 // ---------------------------------------------------------------------------
-if (submitContactForm && dealerResults.length > 0) {
+if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode === 'both')) {
     log.info(`ФАЗА: Попълване на контактни форми за ${dealerResults.length} дилъра…`);
 
     await runWithConcurrency(dealerResults, Math.max(1, Math.floor(maxConcurrency / 2)), async (dealer) => {
