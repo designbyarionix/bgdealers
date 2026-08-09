@@ -30,6 +30,34 @@
       "description": "Колко страници 'Контакти' да се зареждат паралелно едновременно.",
       "default": 10,
       "editor": "number"
+    },
+    "findOfficialWebsite": {
+      "title": "Търсене на официален уебсайт в Google",
+      "type": "boolean",
+      "description": "Ако е включено, за всеки дилър се пуска Apify актор 'apify/google-search-scraper' (готов, официален Apify актор — не се прави Google scraping от нулата) с търсене по името на дилъра, за да се намери собственият му уебсайт (извън mobile.bg, Facebook, OLX и др.).",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "scrapeEmails": {
+      "title": "Извличане на имейли от намерения уебсайт",
+      "type": "boolean",
+      "description": "Работи само ако 'Търсене на официален уебсайт в Google' е включено. Влиза в намерения официален сайт на дилъра (и опитва да намери и страница 'Контакти' в него) и извлича имейл адреси.",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "googleSearchCountryCode": {
+      "title": "Държава за Google търсенето",
+      "type": "string",
+      "description": "ISO код на държавата, използван от google-search-scraper (напр. 'bg' за България).",
+      "default": "bg",
+      "editor": "textfield"
+    },
+    "googleSearchLanguageCode": {
+      "title": "Език за Google търсенето",
+      "type": "string",
+      "description": "ISO код на езика, използван от google-search-scraper (напр. 'bg' за български).",
+      "default": "bg",
+      "editor": "textfield"
     }
   }
 }

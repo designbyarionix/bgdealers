@@ -17,7 +17,19 @@ Apify Actor, който скрейпва **реално** дилъри и тел
    - телефонен(и) номер(а)
    - адрес и кореспондентски адрес
    - от коя година е в mobile.bg
-3. Резултатите се пишат в Apify Dataset (един запис на дилър), достъпни в
+3. **Фаза 3 (опционална, `findOfficialWebsite`) — официален уебсайт чрез
+   Google.** За всеки дилър се пуска готовият, официален Apify актор
+   [`apify/google-search-scraper`](https://apify.com/apify/google-search-scraper)
+   (не се прави Google scraping от нулата) със заявка от типа
+   `"Име на дилъра" автокъща`. От органичните резултати се взима първият, чийто
+   домейн не е mobile.bg, Facebook, Instagram, OLX, Bazar.bg и т.н. — това се
+   записва като `officialWebsite`. Всички заявки за всички дилъри се пращат в
+   **едно** извикване на актора (batch), за да е ефективно.
+4. **Фаза 4 (опционална, `scrapeEmails`) — имейли от намерения сайт.** Ако е
+   намерен официален уебсайт, actor-ът влиза в него, търси mailto: линкове и
+   имейл адреси в текста, а ако не намери нищо на началната страница — опитва
+   да засече линк към "Контакти"/"За нас" и проверява и там.
+5. Резултатите се пишат в Apify Dataset (един запис на дилър), достъпни в
    табличен вид, JSON, CSV, Excel и т.н.
 
 Реализирано е с `CheerioCrawler` (без headless браузър), защото сайтът е
@@ -32,12 +44,18 @@ Apify Actor, който скрейпва **реално** дилъри и тел
 | `maxListingPages` | `0` (без лимит) | Колко страници от списъка да обходи |
 | `maxDealers` | `0` (без лимит) | Колко дилъра да скрейпне (за тестове) |
 | `maxConcurrency` | `10` | Паралелни заявки към страниците "Контакти" |
+| `findOfficialWebsite` | `false` | Търси официалния уебсайт на всеки дилър през `apify/google-search-scraper` |
+| `scrapeEmails` | `false` | Работи само ако `findOfficialWebsite` е включено — вади имейли от намерения сайт |
+| `googleSearchCountryCode` | `bg` | Държава за Google търсенето |
+| `googleSearchLanguageCode` | `bg` | Език за Google търсенето |
 
-Пример за тестов input (само 5 дилъра, за да провериш бързо):
+Пример за тестов input (само 5 дилъра + търсене на сайт + имейли):
 
 ```json
 {
-  "maxDealers": 5
+  "maxDealers": 5,
+  "findOfficialWebsite": true,
+  "scrapeEmails": true
 }
 ```
 
@@ -52,9 +70,23 @@ Apify Actor, който скрейпва **реално** дилъри и тел
   "address": "гр. София, Столична община",
   "correspondenceAddress": "Столична община, ул. Съборна поляна №38",
   "memberSince": "2025",
+  "officialWebsite": "https://atlantic-drive.example",
+  "emails": ["office@atlantic-drive.example"],
   "scrapedAt": "2026-08-10T12:00:00.000Z"
 }
 ```
+
+## ⚠️ Важно за `findOfficialWebsite`
+
+- Изисква Apify акаунт с наличен баланс/платен план, защото извиква друг
+  платен актор (`apify/google-search-scraper`) от твоя акаунт — струва
+  проксита/SERP заявки, отделно от този actor.
+- Ако извикването се провали (напр. няма достатъчно credits или token), actor-ът
+  не спира целия run — просто продължава без `officialWebsite`/`emails` и пише
+  предупреждение в лога.
+- Домейните в "черния списък" (mobile.bg, Facebook, Instagram, OLX, Bazar.bg,
+  Auto.bg, Cars.bg и др.) са в `src/main.js` → константата `BLACKLISTED_DOMAINS`
+  — добави/махни домейни оттам при нужда.
 
 ## Локално стартиране
 

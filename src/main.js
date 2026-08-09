@@ -9,6 +9,10 @@ const {
     maxListingPages = 0, // 0 = без лимит
     maxDealers = 0, // 0 = без лимит
     maxConcurrency = 10,
+    findOfficialWebsite = false,
+    scrapeEmails = false,
+    googleSearchCountryCode = 'bg',
+    googleSearchLanguageCode = 'bg',
 } = input;
 
 /**
@@ -112,6 +116,8 @@ function extractBetween(text, startMarker, endMarkers) {
     return value || null;
 }
 
+const dealerResults = [];
+
 const contactsCrawler = new CheerioCrawler({
     maxConcurrency,
     maxRequestRetries: 2,
@@ -151,6 +157,8 @@ const contactsCrawler = new CheerioCrawler({
             address: trimTo200(address),
             correspondenceAddress: trimTo200(correspondenceAddress),
             memberSince,
+            officialWebsite: null,
+            emails: [],
             scrapedAt: new Date().toISOString(),
         };
 
@@ -158,7 +166,7 @@ const contactsCrawler = new CheerioCrawler({
             reqLog.warning(`Не е намерен телефон за ${dealerUrl} — записвам все пак с празен масив.`);
         }
 
-        await Actor.pushData(result);
+        dealerResults.push(result);
     },
     failedRequestHandler({ request, log: reqLog }) {
         reqLog.warning(`Провалена страница с контакти: ${request.url}`);
@@ -171,6 +179,182 @@ await contactsCrawler.run(
         userData: { dealerUrl, listedName },
     })),
 );
+
+log.info(`Извлечени контакти за ${dealerResults.length} дилъра.`);
+
+/**
+ * ---------------------------------------------------------------------------
+ * ФАЗА 3 (опционална): Търсене на официалния уебсайт на всеки дилър в Google.
+ * Използваме готовия официален Apify актор "apify/google-search-scraper" —
+ * не правим Google scraping от нулата.
+ * ---------------------------------------------------------------------------
+ */
+const BLACKLISTED_DOMAINS = [
+    'mobile.bg',
+    'facebook.com',
+    'instagram.com',
+    'tiktok.com',
+    'youtube.com',
+    'linkedin.com',
+    'olx.bg',
+    'bazar.bg',
+    'imot.bg',
+    'auto.bg',
+    'cars.bg',
+    'google.com',
+    'g.page',
+    'goo.gl',
+    'zlatnistranici.bg',
+    'wikipedia.org',
+    'apify.com',
+];
+
+function isBlacklisted(urlString) {
+    try {
+        const host = new URL(urlString).hostname.replace(/^www\./, '').toLowerCase();
+        return BLACKLISTED_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+    } catch {
+        return true; // невалиден URL -> третираме като неизползваем
+    }
+}
+
+if (findOfficialWebsite && dealerResults.length > 0) {
+    log.info('ФАЗА 3: Търсене на официални уебсайтове чрез apify/google-search-scraper…');
+
+    const dealersWithName = dealerResults.filter((d) => d.dealerName);
+    const queries = dealersWithName.map((d) => `"${d.dealerName}" автокъща`);
+
+    try {
+        const searchRun = await Actor.call('apify/google-search-scraper', {
+            queries: queries.join('\n'),
+            resultsPerPage: 10,
+            maxPagesPerQuery: 1,
+            countryCode: googleSearchCountryCode,
+            languageCode: googleSearchLanguageCode,
+        });
+
+        const searchDataset = await Actor.openDataset(searchRun.defaultDatasetId, { forceCloud: true });
+        const { items: searchItems } = await searchDataset.getData();
+
+        // Мапваме резултата обратно към дилъра по точния текст на заявката.
+        const queryToDealer = new Map();
+        dealersWithName.forEach((d, i) => queryToDealer.set(queries[i], d));
+
+        for (const item of searchItems) {
+            const term = item?.searchQuery?.term;
+            if (!term) continue;
+            const dealer = queryToDealer.get(term);
+            if (!dealer) continue;
+
+            const organicResults = item.organicResults || [];
+            const firstGood = organicResults.find((r) => r?.url && !isBlacklisted(r.url));
+            if (firstGood) {
+                dealer.officialWebsite = firstGood.url;
+            }
+        }
+
+        const foundCount = dealerResults.filter((d) => d.officialWebsite).length;
+        log.info(`Намерени официални уебсайтове за ${foundCount} от ${dealersWithName.length} дилъра.`);
+    } catch (err) {
+        log.warning(`Търсенето в Google се провали: ${err.message}. Продължавам без официални уебсайтове.`);
+    }
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * ФАЗА 4 (опционална): Влизаме в намерения официален уебсайт и извличаме
+ * имейл адреси (mailto: линкове + regex по видимия текст).
+ * ---------------------------------------------------------------------------
+ */
+const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const GENERIC_JUNK_EMAILS = new Set(['example@example.com', 'name@example.com', 'you@example.com']);
+
+async function fetchHtml(url, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; DealerEmailBot/1.0)',
+                Accept: 'text/html,application/xhtml+xml',
+            },
+            redirect: 'follow',
+        });
+        if (!res.ok) return null;
+        return await res.text();
+    } catch {
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function extractEmailsFromHtml(html) {
+    if (!html) return [];
+    const mailtoMatches = [...html.matchAll(/mailto:([^"'\s?>]+)/gi)].map((m) => m[1]);
+    const textMatches = html.match(EMAIL_REGEX) || [];
+    const all = [...mailtoMatches, ...textMatches]
+        .map((e) => e.trim().toLowerCase())
+        .filter((e) => e && !GENERIC_JUNK_EMAILS.has(e) && !e.endsWith('.png') && !e.endsWith('.jpg'));
+    return [...new Set(all)];
+}
+
+async function findContactPageUrl(baseUrl, html) {
+    if (!html) return null;
+    const hrefMatches = [...html.matchAll(/href=["']([^"']+)["']/gi)].map((m) => m[1]);
+    // Първо търсим директно "контакти"/"contact", после падаме към "за нас"/"about"
+    const candidate = hrefMatches.find((h) => /kontakt|contact/i.test(h))
+        || hrefMatches.find((h) => /za-nas|about/i.test(h));
+    if (!candidate) return null;
+    try {
+        return new URL(candidate, baseUrl).toString();
+    } catch {
+        return null;
+    }
+}
+
+// Прост concurrency limiter, за да не заливаме десетки различни външни сайтове наведнъж.
+async function runWithConcurrency(items, limit, worker) {
+    const queue = [...items];
+    const runners = Array.from({ length: Math.max(1, limit) }, async () => {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            await worker(item);
+        }
+    });
+    await Promise.all(runners);
+}
+
+if (findOfficialWebsite && scrapeEmails) {
+    const dealersWithWebsite = dealerResults.filter((d) => d.officialWebsite);
+    log.info(`ФАЗА 4: Извличане на имейли от ${dealersWithWebsite.length} официални уебсайта…`);
+
+    await runWithConcurrency(dealersWithWebsite, 5, async (dealer) => {
+        const homeHtml = await fetchHtml(dealer.officialWebsite);
+        let emails = extractEmailsFromHtml(homeHtml);
+
+        if (emails.length === 0) {
+            const contactUrl = await findContactPageUrl(dealer.officialWebsite, homeHtml);
+            if (contactUrl) {
+                const contactHtml = await fetchHtml(contactUrl);
+                emails = extractEmailsFromHtml(contactHtml);
+            }
+        }
+
+        dealer.emails = emails;
+    });
+
+    const foundEmails = dealerResults.filter((d) => d.emails.length > 0).length;
+    log.info(`Намерени имейли за ${foundEmails} дилъра.`);
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Финално записване в Dataset.
+ * ---------------------------------------------------------------------------
+ */
+await Actor.pushData(dealerResults);
 
 log.info('Готово.');
 
