@@ -1,6 +1,7 @@
 import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
 import playwright from 'playwright';
+import Tesseract from 'tesseract.js';
 
 await Actor.init();
 
@@ -407,6 +408,18 @@ async function solveImageCaptcha2(imageBase64, apiKey, timeoutMs = 120000) {
     throw new Error('2captcha timeout waiting for image solution');
 }
 
+async function solveImageCaptchaOCR(imageBase64) {
+    try {
+        const buffer = Buffer.from(imageBase64, 'base64');
+        const res = await Tesseract.recognize(buffer, 'eng');
+        const text = (res && res.data && res.data.text) ? res.data.text : '';
+        const cleaned = text.replace(/[^A-Za-z0-9]/g, '').trim();
+        return cleaned;
+    } catch (err) {
+        throw new Error(`ocr-failed: ${err.message}`);
+    }
+}
+
 async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
     const browser = await playwright.chromium.launch({ headless: true });
     const context = await browser.newContext();
@@ -489,28 +502,37 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         // Detect image-based captcha (simple distorted text image)
         const imgHandle = await page.$('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
         if (imgHandle) {
-            if (!captchaApiKeyLocal) {
-                await browser.close();
-                return { submitted: false, reason: 'image-captcha-present-no-api-key' };
-            }
             try {
                 const src = await imgHandle.getAttribute('src');
                 const absolute = new URL(src, page.url()).toString();
                 const ab = await fetch(absolute).then((r) => r.arrayBuffer());
                 const base64 = Buffer.from(ab).toString('base64');
-                const solved = await solveImageCaptcha2(base64, captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                let solved = null;
+                if (captchaApiKeyLocal) {
+                    solved = await solveImageCaptcha2(base64, captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                } else {
+                    // Try OCR fallback using Tesseract
+                    try {
+                        solved = await solveImageCaptchaOCR(base64);
+                    } catch (ocrErr) {
+                        await browser.close();
+                        return { submitted: false, reason: `image-captcha-ocr-failed: ${ocrErr.message}` };
+                    }
+                    if (!solved) {
+                        await browser.close();
+                        return { submitted: false, reason: 'image-captcha-present-no-api-key-or-ocr-empty' };
+                    }
+                }
+
                 // Try to find input for the captcha code and fill it
                 const inputSelector = await page.$eval('input[name*="code"], input[name*="captcha"], input[placeholder*="код"], input[id*="code"], input[id*="captcha"]', (el) => el.getAttribute('name') || el.id || null).catch(() => null);
                 if (inputSelector) {
-                    // prefer name attribute selector if present
                     const sel = inputSelector.includes(' ') || inputSelector.includes('#') ? `[name="${inputSelector}"]` : `input[name="${inputSelector}"]`;
                     try { await page.fill(sel, solved.toString()); } catch {}
                 } else {
-                    // fallback: fill first input near the img
                     await page.evaluate((val) => {
                         const img = document.querySelector('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
                         if (!img) return;
-                        // look for input sibling
                         const input = img.parentElement.querySelector('input') || document.querySelector('input');
                         if (input) input.value = val;
                     }, solved.toString());

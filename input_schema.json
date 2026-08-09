@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Mobile.bg Dealers Scraper input",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "Изберете режим: 'scrape' = само събиране; 'send' = само изпращане на съобщения; 'both' = и двете.",
+      "enum": ["scrape", "send", "both"],
+      "default": "scrape"
+    },
+    "dealerUrls": {
+      "type": "array",
+      "title": "Dealer URLs (optional)",
+      "description": "Списък с базови URL адреси на дилъри (например https://atlanticdrive.mobile.bg). Ако е празно, ще се обхожда списъкът от mobile.bg.",
+      "items": { "type": "string", "format": "uri" },
+      "default": []
+    },
+    "submitContactForm": {
+      "type": "boolean",
+      "title": "Submit contact forms",
+      "description": "Ако е true и режимът е 'send' или 'both', Actor-ът ще попълва и подава контактните форми.",
+      "default": false
+    },
+    "contactFormData": {
+      "type": "object",
+      "title": "Contact form data",
+      "description": "Данни, които да се попълнят в контактната форма (name, email, subject, message).",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "subject": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "captchaApiKey": {
+      "type": ["string", "null"],
+      "title": "2Captcha API key",
+      "description": "(Опционално) API ключ за 2captcha, необходим за автоматично решаване на image/text капчи.",
+      "default": null
+    },
+    "startUrl": { "type": "string", "title": "Start URL", "default": "https://www.mobile.bg/dealers" },
+    "maxListingPages": { "type": "integer", "title": "Max listing pages (0 = no limit)", "default": 0 },
+    "maxDealers": { "type": "integer", "title": "Max dealers (0 = no limit)", "default": 0 },
+    "maxConcurrency": { "type": "integer", "title": "Max concurrency", "default": 10 }
+  }
+}
