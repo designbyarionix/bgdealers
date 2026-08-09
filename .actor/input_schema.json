@@ -1,0 +1,34 @@
+{
+  "title": "Mobile.bg Dealers Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Начален URL (списък с дилъри)",
+      "type": "string",
+      "description": "Страницата със списъка на дилърите в mobile.bg",
+      "default": "https://www.mobile.bg/dealers",
+      "editor": "textfield"
+    },
+    "maxListingPages": {
+      "title": "Максимален брой страници от списъка (0 = всички)",
+      "type": "integer",
+      "description": "Ограничава колко страници от /dealers да бъдат обходени. 0 означава без ограничение (ще следва 'Напред' докато има).",
+      "default": 0,
+      "editor": "number"
+    },
+    "maxDealers": {
+      "title": "Максимален брой дилъри за скрейпване (0 = всички)",
+      "type": "integer",
+      "description": "Полезно за тестване с малка извадка преди пълен run.",
+      "default": 0,
+      "editor": "number"
+    },
+    "maxConcurrency": {
+      "title": "Максимална конкурентност при заявките към страниците 'Контакти'",
+      "type": "integer",
+      "default": 10,
+      "editor": "number"
+    }
+  }
+}

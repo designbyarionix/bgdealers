@@ -1,0 +1,18 @@
+{
+  "name": "mobile-bg-dealers-scraper",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Apify actor: scrapes dealer names and phone numbers from mobile.bg/dealers by visiting each dealer's Контакти (Contacts) page.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "start:dev": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.2.6",
+    "crawlee": "^3.11.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
