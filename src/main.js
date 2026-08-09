@@ -1,5 +1,6 @@
 import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
+import playwright from 'playwright';
 
 await Actor.init();
 
@@ -13,6 +14,11 @@ const {
     scrapeEmails = false,
     googleSearchCountryCode = 'bg',
     googleSearchLanguageCode = 'bg',
+    // New options for contact form automation
+    submitContactForm = false,
+    contactFormData = {},
+    captchaApiKey = null,
+    formSubmitTimeoutMs = 60000,
 } = input;
 
 /**
@@ -314,6 +320,138 @@ async function findContactPageUrl(baseUrl, html) {
     }
 }
 
+// -------------------------
+// Playwright form filler + 2captcha support
+// -------------------------
+
+async function solveRecaptcha2(sitekey, pageUrl, apiKey, timeoutMs = 120000) {
+    if (!apiKey) throw new Error('No 2captcha API key provided');
+    const params = new URLSearchParams({
+        key: apiKey,
+        method: 'userrecaptcha',
+        googlekey: sitekey,
+        pageurl: pageUrl,
+        json: '1',
+    });
+    const inRes = await fetch(`http://2captcha.com/in.php?${params.toString()}`);
+    const inJson = await inRes.json();
+    if (!inJson || inJson.status !== 1) throw new Error(`2captcha in.php error: ${JSON.stringify(inJson)}`);
+    const requestId = inJson.request;
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const res = await fetch(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${requestId}&json=1`);
+        const body = await res.json();
+        if (body.status === 1 && body.request) return body.request;
+        if (body.request && body.request.includes('ERROR')) throw new Error(`2captcha error: ${body.request}`);
+    }
+    throw new Error('2captcha timeout waiting for solution');
+}
+
+async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
+    const browser = await playwright.chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        // Find the first form on the page
+        const formHandle = await page.$('form');
+        if (!formHandle) {
+            await browser.close();
+            return { submitted: false, reason: 'no-form-found' };
+        }
+
+        // Collect form fields (inputs + textareas)
+        const fields = await page.$$eval('form input, form textarea, form select', (els) => els.map((el) => ({
+            tag: el.tagName.toLowerCase(),
+            type: el.type || null,
+            name: el.getAttribute('name'),
+            id: el.id || null,
+            placeholder: el.getAttribute('placeholder') || null,
+            aria: el.getAttribute('aria-label') || null,
+        })));
+
+        function matchKey(meta) {
+            if (!meta) return null;
+            const v = `${meta.name || ''} ${meta.id || ''} ${meta.placeholder || ''} ${meta.aria || ''}`.toLowerCase();
+            if (/name|fullname|contact/i.test(v)) return 'name';
+            if (/email|e-?mail/i.test(v)) return 'email';
+            if (/subject|title/i.test(v)) return 'subject';
+            if (/message|msg|comment|description|note/i.test(v)) return 'message';
+            return null;
+        }
+
+        // Fill fields using heuristics
+        for (const meta of fields) {
+            const key = matchKey(meta);
+            if (!key) continue;
+            const value = formData[key];
+            if (!value) continue;
+            // build selector
+            const selectorParts = [];
+            if (meta.name) selectorParts.push(`input[name="${meta.name}"]`, `textarea[name="${meta.name}"]`);
+            if (meta.id) selectorParts.push(`#${meta.id}`);
+            if (meta.placeholder) selectorParts.push(`input[placeholder="${meta.placeholder}"]`, `textarea[placeholder="${meta.placeholder}"]`);
+            const selector = selectorParts.join(', ');
+            try {
+                await page.fill(selector, value.toString());
+            } catch {
+                // best-effort; ignore fill errors
+            }
+        }
+
+        // Detect reCAPTCHA sitekey
+        const sitekey = await page.$eval('[data-sitekey], .g-recaptcha', (el) => el.getAttribute('data-sitekey'),).catch(() => null);
+        let captchaToken = null;
+        if (sitekey) {
+            if (!captchaApiKeyLocal) {
+                await browser.close();
+                return { submitted: false, reason: 'captcha-present-no-api-key' };
+            }
+            try {
+                captchaToken = await solveRecaptcha2(sitekey, page.url(), captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                // Inject token into textarea[name="g-recaptcha-response"]
+                await page.evaluate((token) => {
+                    let textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
+                    if (!textarea) {
+                        textarea = document.createElement('textarea');
+                        textarea.name = 'g-recaptcha-response';
+                        textarea.style.display = 'none';
+                        document.body.appendChild(textarea);
+                    }
+                    textarea.value = token;
+                }, captchaToken);
+            } catch (err) {
+                await browser.close();
+                return { submitted: false, reason: `captcha-solve-failed: ${err.message}` };
+            }
+        }
+
+        // Submit the form: try to click submit button or submit programmatically
+        const clicked = await page.$eval('form', (f) => {
+            const btn = f.querySelector('button[type="submit"], input[type="submit"]');
+            if (btn) { btn.click(); return true; }
+            try { f.submit(); return true; } catch { return false; }
+        }).catch(() => false);
+
+        // Wait for navigation or a short delay
+        try {
+            await Promise.race([
+                page.waitForNavigation({ timeout: 5000 }).catch(() => null),
+                new Promise((r) => setTimeout(r, 3000)),
+            ]);
+        } catch {}
+
+        await browser.close();
+        return { submitted: true, clicked: !!clicked, captchaToken: captchaToken || null };
+    } catch (err) {
+        await browser.close();
+        return { submitted: false, reason: err.message };
+    }
+}
+
 // Прост concurrency limiter, за да не заливаме десетки различни външни сайтове наведнъж.
 async function runWithConcurrency(items, limit, worker) {
     const queue = [...items];
@@ -347,6 +485,25 @@ if (findOfficialWebsite && scrapeEmails) {
 
     const foundEmails = dealerResults.filter((d) => d.emails.length > 0).length;
     log.info(`Намерени имейли за ${foundEmails} дилъра.`);
+}
+
+// ---------------------------------------------------------------------------
+// Optional Phase: submit contact forms on the dealers' contact pages
+// ---------------------------------------------------------------------------
+if (submitContactForm && dealerResults.length > 0) {
+    log.info(`ФАЗА: Попълване на контактни форми за ${dealerResults.length} дилъра…`);
+
+    await runWithConcurrency(dealerResults, Math.max(1, Math.floor(maxConcurrency / 2)), async (dealer) => {
+        try {
+            const res = await submitContactFormWithPlaywright(dealer.contactsUrl, contactFormData, captchaApiKey, formSubmitTimeoutMs);
+            dealer.contactForm = res;
+        } catch (err) {
+            dealer.contactForm = { submitted: false, reason: err.message };
+        }
+    });
+
+    const submittedCount = dealerResults.filter((d) => d.contactForm && d.contactForm.submitted).length;
+    log.info(`Успешно подадени форми за ${submittedCount} дилъра.`);
 }
 
 /**

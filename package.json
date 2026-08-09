@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "apify": "^3.2.6",
-    "crawlee": "^3.11.1"
+    "crawlee": "^3.11.1",
+    "playwright": "^1.40.0"
   },
   "engines": {
     "node": ">=18.0.0"
