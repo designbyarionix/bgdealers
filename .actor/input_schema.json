@@ -70,6 +70,7 @@
       "title": "Данни за контактната форма",
       "type": "object",
       "description": "Данните, които да се попълнят в контактната форма (name, phone, email, subject, message).",
+      "editor": "json",
       "properties": {
         "name": { "type": "string", "title": "Име", "description": "Името, което да се попълни в контактната форма." },
         "phone": { "type": "string", "title": "Телефон", "description": "Телефонният номер, който да се попълни в контактната форма." },

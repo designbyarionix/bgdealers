@@ -1,0 +1,13 @@
+{
+  "mode": "send",
+  "dealerUrls": ["https://atlanticdrive.mobile.bg"],
+  "submitContactForm": true,
+  "contactFormData": {
+    "name": "Тест Тестов",
+    "email": "test@example.com",
+    "message": "Здравейте, това е тестово съобщение."
+  },
+  "captchaApiKey": null,
+  "debugSaveCaptcha": true,
+  "maxConcurrency": 2
+}
