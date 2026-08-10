@@ -74,7 +74,7 @@
       "properties": {
         "name": { "type": "string", "title": "Име", "description": "Името, което да се попълни в контактната форма." },
         "phone": { "type": "string", "title": "Телефон", "description": "Телефонният номер, който да се попълни в контактната форма." },
-        "email": { "type": "string", "format": "email", "title": "Email", "description": "Email адресът, който да се попълни в контактната форма." },
+        "email": { "type": "string", "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$", "title": "Email", "description": "Email адресът, който да се попълни в контактната форма." },
         "subject": { "type": "string", "title": "Тема", "description": "Тема на съобщението за контактната форма." },
         "message": { "type": "string", "title": "Съобщение", "description": "Текстът на съобщението за контактната форма." }
       }
