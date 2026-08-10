@@ -6,13 +6,17 @@
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
-    "start:dev": "node src/main.js"
+    "start:dev": "node src/main.js",
+    "start:local": "node local_main.js local_input.json",
+    "start:web": "node web.js"
   },
   "dependencies": {
     "apify": "^3.2.6",
     "crawlee": "^3.11.1",
+    "express": "^4.18.4",
     "playwright": "^1.40.0",
-    "tesseract.js": "^4.0.2"
+    "tesseract.js": "^4.0.2",
+    "sharp": "^0.32.4"
   },
   "engines": {
     "node": ">=18.0.0"

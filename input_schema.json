@@ -29,6 +29,7 @@
       "description": "Данни, които да се попълнят в контактната форма (name, email, subject, message).",
       "properties": {
         "name": { "type": "string" },
+        "phone": { "type": "string" },
         "email": { "type": "string", "format": "email" },
         "subject": { "type": "string" },
         "message": { "type": "string" }
@@ -39,6 +40,12 @@
       "title": "2Captcha API key",
       "description": "(Опционално) API ключ за 2captcha, необходим за автоматично решаване на image/text капчи.",
       "default": null
+    },
+    "debugSaveCaptcha": {
+      "type": "boolean",
+      "title": "Save captcha images and solutions",
+      "description": "Ако е true, Actor-ът ще запазва всяка captcha снимка и опита за разчитане в папка captchas/ (локално) или workspace.",
+      "default": false
     },
     "startUrl": { "type": "string", "title": "Start URL", "default": "https://www.mobile.bg/dealers" },
     "maxListingPages": { "type": "integer", "title": "Max listing pages (0 = no limit)", "default": 0 },

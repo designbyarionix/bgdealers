@@ -2,6 +2,8 @@ import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
 import playwright from 'playwright';
 import Tesseract from 'tesseract.js';
+import sharp from 'sharp';
+import fs from 'fs/promises';
 
 await Actor.init();
 
@@ -20,6 +22,7 @@ const {
     contactFormData = {},
     captchaApiKey = null,
     formSubmitTimeoutMs = 60000,
+    debugSaveCaptcha = false,
     // mode: 'scrape' (default) = collect data; 'send' = only submit contact forms;
     // 'both' = scrape then submit forms.
     mode = 'scrape',
@@ -135,7 +138,7 @@ function extractBetween(text, startMarker, endMarkers) {
     return value || null;
 }
 
-const dealerResults = [];
+let dealerResults = [];
 
 const contactsCrawler = new CheerioCrawler({
     maxConcurrency,
@@ -411,13 +414,45 @@ async function solveImageCaptcha2(imageBase64, apiKey, timeoutMs = 120000) {
 async function solveImageCaptchaOCR(imageBase64) {
     try {
         const buffer = Buffer.from(imageBase64, 'base64');
-        const res = await Tesseract.recognize(buffer, 'eng');
+        // Preprocess image: grayscale, upscale, normalize, threshold
+        const img = sharp(buffer);
+        const meta = await img.metadata();
+        const width = meta.width || 200;
+        const processed = await img
+            .grayscale()
+            .resize(Math.min(1000, Math.max(200, Math.round(width * 2))))
+            .normalise()
+            .threshold(140)
+            .toBuffer();
+
+        const res = await Tesseract.recognize(processed, 'eng');
         const text = (res && res.data && res.data.text) ? res.data.text : '';
         const cleaned = text.replace(/[^A-Za-z0-9]/g, '').trim();
         return cleaned;
     } catch (err) {
         throw new Error(`ocr-failed: ${err.message}`);
     }
+}
+
+async function detectSubmitResult(page) {
+    const content = (await page.content()).replace(/\s+/g, ' ').trim().toLowerCase();
+    const successPatterns = [
+        /изпратен[оa]?/, /успешн[оa]?/, /благодарим/, /thank you/, /your message/, /съобщението е изпратено/, /заявката е получена/, /вече е изпратено/,
+        /вашето (запитване|съобщение) (е )?изпратен[оa]?/, /съобщението беше изпратено/, /успешно изпратено/, /благодарим ви/, /thank you for/, /message has been sent/
+    ];
+    const errorPatterns = [
+        /грешк[аие]*/i, /не( е)? изпратено/, /неуспешн[оa]?/, /captcha/i, /грешен/, /невалидн[аои]?/, /моля/, /попълн[ете]?/, /код за потвърждение/, /please fill/, /invalid/, /failed/, /error/
+    ];
+    const url = page.url().toLowerCase();
+    const formStillVisible = await page.$('form').then(Boolean).catch(() => false);
+    const hasSuccess = successPatterns.some((re) => re.test(content)) || /thank-you|thanks|success|successful/.test(url);
+    const hasError = errorPatterns.some((re) => re.test(content)) || /error|failed|неуспешн[оa]?/.test(url);
+    return {
+        pageTextSnippet: content.slice(0, 500),
+        isSuccess: hasSuccess,
+        isError: hasError,
+        formStillVisible,
+    };
 }
 
 async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
@@ -434,25 +469,57 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             return { submitted: false, reason: 'no-form-found' };
         }
 
-        // Collect form fields (inputs + textareas)
-        const fields = await page.$$eval('form input, form textarea, form select', (els) => els.map((el) => ({
-            tag: el.tagName.toLowerCase(),
-            type: el.type || null,
-            name: el.getAttribute('name'),
-            id: el.id || null,
-            placeholder: el.getAttribute('placeholder') || null,
-            aria: el.getAttribute('aria-label') || null,
-        })));
+        // Collect form fields (inputs + textareas), including nearby label text.
+        const fields = await page.$$eval('form:first-of-type input, form:first-of-type textarea, form:first-of-type select', (els) => els.map((el) => {
+            const name = el.getAttribute('name');
+            const id = el.id || null;
+            const placeholder = el.getAttribute('placeholder') || '';
+            const aria = el.getAttribute('aria-label') || '';
+            const className = el.className || '';
+            let label = '';
+            if (id) {
+                const labelEl = document.querySelector(`label[for="${id}"]`);
+                if (labelEl) label = labelEl.innerText || '';
+            }
+            if (!label) {
+                let parent = el.parentElement;
+                for (let i = 0; i < 3 && parent; i += 1) {
+                    if (parent.tagName.toLowerCase() === 'label') {
+                        label = parent.innerText || '';
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            return {
+                tag: el.tagName.toLowerCase(),
+                type: el.type || null,
+                name,
+                id,
+                placeholder,
+                aria,
+                label,
+                className,
+            };
+        }));
 
         function matchKey(meta) {
             if (!meta) return null;
-            const v = `${meta.name || ''} ${meta.id || ''} ${meta.placeholder || ''} ${meta.aria || ''}`.toLowerCase();
-            if (/name|fullname|contact/i.test(v)) return 'name';
-            if (/email|e-?mail/i.test(v)) return 'email';
-            if (/subject|title/i.test(v)) return 'subject';
-            if (/message|msg|comment|description|note/i.test(v)) return 'message';
+            const v = `${meta.name || ''} ${meta.id || ''} ${meta.placeholder || ''} ${meta.aria || ''} ${meta.label || ''} ${meta.className || ''}`.toLowerCase();
+            if (/phone|телефон|мобилен|gsm|fone|mobile/i.test(v)) return 'phone';
+            if (/name|fullname|contact|име|фирма/i.test(v)) return 'name';
+            if (/email|e-?mail|имейл|електронна|поща/i.test(v)) return 'email';
+            if (/subject|title|тема|предмет/i.test(v)) return 'subject';
+            if (/message|msg|comment|description|note|запитване|съобщение|съобщението/i.test(v)) return 'message';
             return null;
         }
+
+        // Check agreement boxes if present.
+        await page.$$eval('form:first-of-type input[type=checkbox]', (els) => {
+            els.forEach((checkbox) => {
+                if (!checkbox.checked) checkbox.click();
+            });
+        }).catch(() => null);
 
         // Fill fields using heuristics
         for (const meta of fields) {
@@ -460,14 +527,17 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             if (!key) continue;
             const value = formData[key];
             if (!value) continue;
-            // build selector
             const selectorParts = [];
-            if (meta.name) selectorParts.push(`input[name="${meta.name}"]`, `textarea[name="${meta.name}"]`);
+            if (meta.name) selectorParts.push(`input[name="${meta.name}"]`, `textarea[name="${meta.name}"]`, `select[name="${meta.name}"]`);
             if (meta.id) selectorParts.push(`#${meta.id}`);
             if (meta.placeholder) selectorParts.push(`input[placeholder="${meta.placeholder}"]`, `textarea[placeholder="${meta.placeholder}"]`);
             const selector = selectorParts.join(', ');
             try {
-                await page.fill(selector, value.toString());
+                if (meta.tag === 'select') {
+                    await page.selectOption(selector, value.toString());
+                } else {
+                    await page.fill(selector, value.toString());
+                }
             } catch {
                 // best-effort; ignore fill errors
             }
@@ -526,6 +596,20 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
 
                 // Try to find input for the captcha code and fill it
                 const inputSelector = await page.$eval('input[name*="code"], input[name*="captcha"], input[placeholder*="код"], input[id*="code"], input[id*="captcha"]', (el) => el.getAttribute('name') || el.id || null).catch(() => null);
+                // Optionally save captcha image and solution for debugging
+                if (debugSaveCaptcha) {
+                    try {
+                        await fs.mkdir('captchas', { recursive: true });
+                        const host = new URL(page.url()).hostname.replace(/[^a-z0-9.-]/gi, '_');
+                        const stamp = Date.now();
+                        const imgPath = `captchas/${host}-${stamp}.png`;
+                        await fs.writeFile(imgPath, Buffer.from(base64, 'base64'));
+                        await fs.writeFile(`${imgPath}.txt`, solved.toString(), 'utf8');
+                    } catch (e) {
+                        // ignore save errors
+                    }
+                }
+
                 if (inputSelector) {
                     const sel = inputSelector.includes(' ') || inputSelector.includes('#') ? `[name="${inputSelector}"]` : `input[name="${inputSelector}"]`;
                     try { await page.fill(sel, solved.toString()); } catch {}
@@ -543,12 +627,17 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             }
         }
 
-        // Submit the form: try to click submit button or submit programmatically
-        const clicked = await page.$eval('form', (f) => {
-            const btn = f.querySelector('button[type="submit"], input[type="submit"]');
-            if (btn) { btn.click(); return true; }
-            try { f.submit(); return true; } catch { return false; }
-        }).catch(() => false);
+        // Submit the form: try visible submit controls first, then fallback to JS-triggering buttons or form.submit().
+        let clicked = false;
+        clicked = await page.$eval('form:first-of-type button[type="submit"], form:first-of-type input[type="submit"]', (el) => { el.click(); return true; }).catch(() => false);
+        if (!clicked) {
+            clicked = await page.$eval('form:first-of-type .addButton, form:first-of-type [onclick*="submit"], form:first-of-type [type="button"]', (el) => { el.click(); return true; }).catch(() => false);
+        }
+        if (!clicked) {
+            clicked = await page.$eval('form:first-of-type', (f) => {
+                try { f.submit(); return true; } catch { return false; }
+            }).catch(() => false);
+        }
 
         // Wait for navigation or a short delay
         try {
@@ -558,8 +647,23 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
             ]);
         } catch {}
 
+        const submitResult = await detectSubmitResult(page);
+        const finalUrl = page.url();
         await browser.close();
-        return { submitted: true, clicked: !!clicked, captchaToken: captchaToken || null };
+
+        const success = submitResult.isSuccess && !submitResult.isError;
+        const error = submitResult.isError && !submitResult.isSuccess;
+
+        return {
+            submitted: !!clicked,
+            clicked: !!clicked,
+            captchaToken: captchaToken || null,
+            finalUrl,
+            success,
+            error,
+            confirmationSnippet: submitResult.pageTextSnippet,
+            reason: !clicked ? 'submit-action-failed' : (!success && !error ? 'unknown-response' : undefined),
+        };
     } catch (err) {
         await browser.close();
         return { submitted: false, reason: err.message };

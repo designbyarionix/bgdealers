@@ -58,6 +58,39 @@
       "description": "ISO код на езика, използван от google-search-scraper (напр. 'bg' за български).",
       "default": "bg",
       "editor": "textfield"
+    },
+    "submitContactForm": {
+      "title": "Изпращане на контактни форми",
+      "type": "boolean",
+      "description": "Ако е включено и режимът е 'send' или 'both', актьорът ще попълва и подава контактната форма на дилъра.",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "contactFormData": {
+      "title": "Данни за контактната форма",
+      "type": "object",
+      "description": "Данните, които да се попълнят в контактната форма (name, phone, email, subject, message).",
+      "properties": {
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "subject": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "captchaApiKey": {
+      "title": "2Captcha API ключ",
+      "type": ["string", "null"],
+      "description": "Опционален ключ за 2captcha, ако е нужно автоматично решаване на капча.",
+      "default": null,
+      "editor": "textfield"
+    },
+    "debugSaveCaptcha": {
+      "title": "Запази captcha изображения",
+      "type": "boolean",
+      "description": "Ако е включено, актьорът ще запазва намерените captcha изображения и решения в папка captchas/.",
+      "default": false,
+      "editor": "checkbox"
     }
   }
 }

@@ -2,7 +2,7 @@
   "actorSpecification": 1,
   "name": "mobile-bg-dealers-scraper",
   "title": "Mobile.bg Dealers & Phone Scraper",
-  "description": "Обхожда https://www.mobile.bg/dealers, събира всички дилъри, влиза в сайта на всеки дилър, отваря страницата 'Контакти' и извлича телефонния номер, адреса и името на дилъра.",
+  "description": "Обхожда https://www.mobile.bg/dealers, събира всички дилъри, влиза в сайта на всеки дилър, отваря страницата 'Контакти', попълва контактна форма и изпраща съобщение, както и извлича телефонния номер, адреса и името на дилъра.",
   "version": "0.1",
   "input": "./input_schema.json",
   "dockerfile": "../Dockerfile",
