@@ -500,6 +500,17 @@ async function detectSubmitResult(page) {
 }
 
 async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
+    const dealerHost = new URL(url).hostname;
+    // Проследяваме какво се случи с капчата на тази страница, за да можем
+    // да логнем и върнем ясен отговор дали е минала успешно.
+    const captchaInfo = {
+        present: false,       // дали изобщо е открита капча на формата
+        type: 'none',         // 'none' | 'recaptcha' | 'image'
+        solveMethod: 'none',  // 'none' | '2captcha' | 'ocr'
+        solveAttempted: false,
+        solveValue: null,     // решението, което сме подали (текст/token) — за debug
+        passed: null,          // true/false/null(неясно) — попълва се накрая, след submit
+    };
     const browser = await playwright.chromium.launch({ headless: true });
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -510,7 +521,7 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         const formHandle = await page.$('form');
         if (!formHandle) {
             await browser.close();
-            return { submitted: false, reason: 'no-form-found' };
+            return { status: 'failed', submitted: false, success: false, reason: 'no-form-found', captcha: captchaInfo };
         }
 
         // Collect form fields (inputs + textareas), including nearby label text.
@@ -591,12 +602,19 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         const sitekey = await page.$eval('[data-sitekey], .g-recaptcha', (el) => el.getAttribute('data-sitekey'),).catch(() => null);
         let captchaToken = null;
         if (sitekey) {
+            captchaInfo.present = true;
+            captchaInfo.type = 'recaptcha';
             if (!captchaApiKeyLocal) {
+                log.warning(`[Captcha] ${dealerHost}: открита reCAPTCHA, но няма зададен API ключ — прескачам.`);
                 await browser.close();
-                return { submitted: false, reason: 'captcha-present-no-api-key' };
+                return { status: 'failed', submitted: false, success: false, reason: 'captcha-present-no-api-key', captcha: captchaInfo };
             }
+            captchaInfo.solveMethod = '2captcha';
+            captchaInfo.solveAttempted = true;
             try {
                 captchaToken = await solveRecaptcha2(sitekey, page.url(), captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                captchaInfo.solveValue = captchaToken ? `${captchaToken.slice(0, 12)}…` : null;
+                log.info(`[Captcha] ${dealerHost}: reCAPTCHA решена през 2captcha, token получен.`);
                 await page.evaluate((token) => {
                     let textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
                     if (!textarea) {
@@ -608,14 +626,17 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
                     textarea.value = token;
                 }, captchaToken);
             } catch (err) {
+                log.warning(`[Captcha] ${dealerHost}: решаването на reCAPTCHA се провали — ${err.message}`);
                 await browser.close();
-                return { submitted: false, reason: `captcha-solve-failed: ${err.message}` };
+                return { status: 'failed', submitted: false, success: false, reason: `captcha-solve-failed: ${err.message}`, captcha: captchaInfo };
             }
         }
 
         // Detect image-based captcha (simple distorted text image)
         const imgHandle = await page.$('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
         if (imgHandle) {
+            captchaInfo.present = true;
+            captchaInfo.type = 'image';
             try {
                 const src = await imgHandle.getAttribute('src');
                 const absolute = new URL(src, page.url()).toString();
@@ -623,18 +644,28 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
                 const base64 = Buffer.from(ab).toString('base64');
                 let solved = null;
                 if (captchaApiKeyLocal) {
+                    captchaInfo.solveMethod = '2captcha';
+                    captchaInfo.solveAttempted = true;
                     solved = await solveImageCaptcha2(base64, captchaApiKeyLocal, Math.min(120000, timeoutMs));
+                    captchaInfo.solveValue = solved || null;
+                    log.info(`[Captcha] ${dealerHost}: картинна капча решена през 2captcha -> "${solved}"`);
                 } else {
                     // Try OCR fallback using Tesseract
+                    captchaInfo.solveMethod = 'ocr';
+                    captchaInfo.solveAttempted = true;
                     try {
                         solved = await solveImageCaptchaOCR(base64);
+                        captchaInfo.solveValue = solved || null;
+                        log.info(`[Captcha] ${dealerHost}: OCR (безплатно) прочете картинната капча като "${solved || '(празно)'}"`);
                     } catch (ocrErr) {
+                        log.warning(`[Captcha] ${dealerHost}: OCR не успя да прочете капчата — ${ocrErr.message}`);
                         await browser.close();
-                        return { submitted: false, reason: `image-captcha-ocr-failed: ${ocrErr.message}` };
+                        return { status: 'failed', submitted: false, success: false, reason: `image-captcha-ocr-failed: ${ocrErr.message}`, captcha: captchaInfo };
                     }
                     if (!solved) {
+                        log.warning(`[Captcha] ${dealerHost}: OCR върна празен резултат — прескачам дилъра.`);
                         await browser.close();
-                        return { submitted: false, reason: 'image-captcha-present-no-api-key-or-ocr-empty' };
+                        return { status: 'failed', submitted: false, success: false, reason: 'image-captcha-present-no-api-key-or-ocr-empty', captcha: captchaInfo };
                     }
                 }
 
@@ -666,8 +697,9 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
                     }, solved.toString());
                 }
             } catch (err) {
+                log.warning(`[Captcha] ${dealerHost}: грешка при обработка на картинната капча — ${err.message}`);
                 await browser.close();
-                return { submitted: false, reason: `image-captcha-solve-failed: ${err.message}` };
+                return { status: 'failed', submitted: false, success: false, reason: `image-captcha-solve-failed: ${err.message}`, captcha: captchaInfo };
             }
         }
 
@@ -698,19 +730,54 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         const success = submitResult.isSuccess && !submitResult.isError;
         const error = submitResult.isError && !submitResult.isSuccess;
 
+        // status е ясният, недвусмислен резултат:
+        //  - 'sent'            -> бутонът е кликнат И сайтът потвърди успех (изпратено наистина)
+        //  - 'failed'          -> бутонът НЕ е кликнат, ИЛИ сайтът показа съобщение за грешка
+        //  - 'unknown-clicked' -> бутонът е кликнат, но не открихме нито ясно потвърждение,
+        //                         нито ясна грешка на страницата (провери "confirmationSnippet"
+        //                         ръчно за такива редове — вероятно формата все пак е стигнала,
+        //                         но сайтът не показва разпознат от нас текст за успех)
+        let status;
+        if (!clicked) {
+            status = 'failed';
+        } else if (success) {
+            status = 'sent';
+        } else if (error) {
+            status = 'failed';
+        } else {
+            status = 'unknown-clicked';
+        }
+
+        // Определяме дали капчата реално е минала, въз основа на финалния
+        // резултат от страницата (само ако изобщо е имало капча за тази форма).
+        if (captchaInfo.present) {
+            const captchaErrorHints = /captcha|грешен код|невалиден код|код за потвърждение/i.test(submitResult.pageTextSnippet);
+            if (status === 'sent') {
+                captchaInfo.passed = true;
+            } else if (captchaErrorHints) {
+                captchaInfo.passed = false;
+            } else {
+                captchaInfo.passed = null; // неясно — кликнато е, но не е сигурно дали капчата е причината
+            }
+
+            const passedLabel = captchaInfo.passed === true ? 'МИНА успешно' : captchaInfo.passed === false ? 'НЕ мина (грешен код)' : 'неясно';
+            log.info(`[Captcha] ${dealerHost}: тип=${captchaInfo.type}, метод=${captchaInfo.solveMethod}, резултат=${passedLabel}`);
+        }
+
         return {
-            submitted: !!clicked,
-            clicked: !!clicked,
-            captchaToken: captchaToken || null,
-            finalUrl,
-            success,
+            status,
+            submitted: !!clicked, // само дали бутонът е бил натиснат — НЕ означава че е стигнало
+            success,              // true само ако сайтът реално потвърди изпращане
             error,
+            captchaToken: captchaToken || null,
+            captcha: captchaInfo, // { present, type, solveMethod, solveAttempted, solveValue, passed }
+            finalUrl,
             confirmationSnippet: submitResult.pageTextSnippet,
-            reason: !clicked ? 'submit-action-failed' : (!success && !error ? 'unknown-response' : undefined),
+            reason: !clicked ? 'submit-action-failed' : (status === 'unknown-clicked' ? 'no-clear-confirmation-on-page' : undefined),
         };
     } catch (err) {
         await browser.close();
-        return { submitted: false, reason: err.message };
+        return { status: 'failed', submitted: false, success: false, reason: err.message, captcha: captchaInfo };
     }
 }
 
@@ -772,7 +839,7 @@ if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode ==
         try {
             const res = await submitContactFormWithPlaywright(dealer.contactsUrl, contactFormData, captchaApiKey, formSubmitTimeoutMs);
             dealer.contactForm = res;
-            if (res && res.submitted) {
+            if (res && res.status === 'sent') {
                 contactedUrls.add(dealer.dealerUrl);
             }
         } catch (err) {
@@ -780,8 +847,18 @@ if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode ==
         }
     });
 
-    const submittedCount = targets.filter((d) => d.contactForm && d.contactForm.submitted).length;
-    log.info(`Успешно подадени форми за ${submittedCount} дилъра.`);
+    const sentCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'sent').length;
+    const unknownCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'unknown-clicked').length;
+    const failedCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'failed').length;
+    log.info(`Резултат от изпращането: ${sentCount} реално изпратени (потвърдени), ${unknownCount} неясни (бутонът е кликнат, но няма ясно потвърждение — провери "confirmationSnippet"), ${failedCount} неуспешни.`);
+
+    const withCaptcha = targets.filter((d) => d.contactForm && d.contactForm.captcha && d.contactForm.captcha.present);
+    if (withCaptcha.length > 0) {
+        const captchaPassed = withCaptcha.filter((d) => d.contactForm.captcha.passed === true).length;
+        const captchaFailed = withCaptcha.filter((d) => d.contactForm.captcha.passed === false).length;
+        const captchaUnknown = withCaptcha.filter((d) => d.contactForm.captcha.passed === null).length;
+        log.info(`Капчи: ${withCaptcha.length} дилъра имаха капча -> ${captchaPassed} минати успешно, ${captchaFailed} неуспешни, ${captchaUnknown} неясни.`);
+    }
 
     // Записваме обновения списък с контактувани дилъри за следващи run-ове.
     await contactedStore.setValue('contactedUrls', [...contactedUrls]);
