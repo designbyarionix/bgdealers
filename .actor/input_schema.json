@@ -71,11 +71,11 @@
       "type": "object",
       "description": "Данните, които да се попълнят в контактната форма (name, phone, email, subject, message).",
       "properties": {
-        "name": { "type": "string" },
-        "phone": { "type": "string" },
-        "email": { "type": "string", "format": "email" },
-        "subject": { "type": "string" },
-        "message": { "type": "string" }
+        "name": { "type": "string", "title": "Име" },
+        "phone": { "type": "string", "title": "Телефон" },
+        "email": { "type": "string", "format": "email", "title": "Email" },
+        "subject": { "type": "string", "title": "Тема" },
+        "message": { "type": "string", "title": "Съобщение" }
       }
     },
     "captchaApiKey": {

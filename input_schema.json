@@ -28,11 +28,11 @@
       "title": "Contact form data",
       "description": "Данни, които да се попълнят в контактната форма (name, email, subject, message).",
       "properties": {
-        "name": { "type": "string" },
-        "phone": { "type": "string" },
-        "email": { "type": "string", "format": "email" },
-        "subject": { "type": "string" },
-        "message": { "type": "string" }
+        "name": { "type": "string", "title": "Name" },
+        "phone": { "type": "string", "title": "Phone" },
+        "email": { "type": "string", "format": "email", "title": "Email" },
+        "subject": { "type": "string", "title": "Subject" },
+        "message": { "type": "string", "title": "Message" }
       }
     },
     "captchaApiKey": {
