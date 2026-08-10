@@ -66,18 +66,36 @@
       "default": false,
       "editor": "checkbox"
     },
-    "contactFormData": {
-      "title": "Данни за контактната форма",
-      "type": "object",
-      "description": "Данните, които да се попълнят в контактната форма (name, phone, email, subject, message).",
-      "editor": "json",
-      "properties": {
-        "name": { "type": "string", "title": "Име", "description": "Името, което да се попълни в контактната форма." },
-        "phone": { "type": "string", "title": "Телефон", "description": "Телефонният номер, който да се попълни в контактната форма." },
-        "email": { "type": "string", "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$", "title": "Email", "description": "Email адресът, който да се попълни в контактната форма." },
-        "subject": { "type": "string", "title": "Тема", "description": "Тема на съобщението за контактната форма." },
-        "message": { "type": "string", "title": "Съобщение", "description": "Текстът на съобщението за контактната форма." }
-      }
+    "contactName": {
+      "title": "Име (за контактната форма)",
+      "type": "string",
+      "description": "Името, което да се попълни в полето 'Вашето име' на контактната форма на дилъра.",
+      "editor": "textfield"
+    },
+    "contactPhone": {
+      "title": "Телефон (за контактната форма)",
+      "type": "string",
+      "description": "Телефонният номер, който да се попълни в полето 'Вашия телефон' на контактната форма на дилъра.",
+      "editor": "textfield"
+    },
+    "contactEmail": {
+      "title": "Email (за контактната форма)",
+      "type": "string",
+      "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$",
+      "description": "Email адресът, който да се попълни в полето 'Вашия e-mail' на контактната форма на дилъра.",
+      "editor": "textfield"
+    },
+    "contactSubject": {
+      "title": "Тема (ако формата има такова поле)",
+      "type": "string",
+      "description": "Тема на съобщението — попълва се само ако конкретната форма на дилъра има отделно поле 'Тема'.",
+      "editor": "textfield"
+    },
+    "contactMessage": {
+      "title": "Текст на запитването",
+      "type": "string",
+      "description": "Текстът, който да се попълни в полето 'Запитване' / 'Съобщение' на контактната форма на дилъра.",
+      "editor": "textarea"
     },
     "captchaApiKey": {
       "title": "2Captcha API ключ",

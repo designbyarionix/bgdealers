@@ -19,7 +19,11 @@ const {
     googleSearchLanguageCode = 'bg',
     // New options for contact form automation
     submitContactForm = false,
-    contactFormData = {},
+    contactName = '',
+    contactPhone = '',
+    contactEmail = '',
+    contactSubject = '',
+    contactMessage = '',
     captchaApiKey = null,
     formSubmitTimeoutMs = 60000,
     debugSaveCaptcha = false,
@@ -29,6 +33,16 @@ const {
     // Optional: supply explicit list of dealer base URLs to operate on instead of crawling
     dealerUrls = [],
 } = input;
+
+// Сглобяваме обекта, който се подава на попълвача на формата, от отделните
+// плоски полета на входа (name/phone/email/subject/message).
+const contactFormData = {
+    name: contactName,
+    phone: contactPhone,
+    email: contactEmail,
+    subject: contactSubject,
+    message: contactMessage,
+};
 
 /**
  * ---------------------------------------------------------------------------
