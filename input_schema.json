@@ -28,11 +28,11 @@
       "title": "Contact form data",
       "description": "Данни, които да се попълнят в контактната форма (name, email, subject, message).",
       "properties": {
-        "name": { "type": "string", "title": "Name" },
-        "phone": { "type": "string", "title": "Phone" },
-        "email": { "type": "string", "format": "email", "title": "Email" },
-        "subject": { "type": "string", "title": "Subject" },
-        "message": { "type": "string", "title": "Message" }
+        "name": { "type": "string", "title": "Name", "description": "The name to fill into the contact form." },
+        "phone": { "type": "string", "title": "Phone", "description": "The phone number to fill into the contact form." },
+        "email": { "type": "string", "format": "email", "title": "Email", "description": "The email address to fill into the contact form." },
+        "subject": { "type": "string", "title": "Subject", "description": "The subject line to fill into the contact form." },
+        "message": { "type": "string", "title": "Message", "description": "The message body to fill into the contact form." }
       }
     },
     "captchaApiKey": {
