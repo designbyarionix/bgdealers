@@ -81,9 +81,8 @@
     },
     "captchaApiKey": {
       "title": "2Captcha API ключ",
-      "type": ["string", "null"],
+      "type": "string",
       "description": "Опционален ключ за 2captcha, ако е нужно автоматично решаване на капча.",
-      "default": null,
       "editor": "textfield"
     },
     "debugSaveCaptcha": {
