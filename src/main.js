@@ -10,6 +10,7 @@ await Actor.init();
 const input = (await Actor.getInput()) ?? {};
 const {
     startUrl = 'https://www.mobile.bg/dealers',
+    startPage = 1,
     maxListingPages = 0, // 0 = без лимит
     maxDealers = 0, // 0 = без лимит
     maxConcurrency = 10,
@@ -19,6 +20,8 @@ const {
     googleSearchLanguageCode = 'bg',
     // New options for contact form automation
     submitContactForm = false,
+    skipAlreadyContacted = true,
+    resetContactedHistory = false,
     contactName = '',
     contactPhone = '',
     contactEmail = '',
@@ -43,6 +46,33 @@ const contactFormData = {
     subject: contactSubject,
     message: contactMessage,
 };
+
+// Ако е зададена начална страница > 1, построяваме URL по схемата на
+// пагинацията на mobile.bg (.../dealers/p-N), вместо потребителят да трябва
+// сам да познае/копира адреса на конкретната страница.
+function buildStartUrl(baseUrl, page) {
+    if (!page || page <= 1) return baseUrl;
+    const trimmed = baseUrl.replace(/\/+$/, '');
+    const withoutExistingPage = trimmed.replace(/\/p-\d+$/i, '');
+    return `${withoutExistingPage}/p-${page}`;
+}
+const effectiveStartUrl = buildStartUrl(startUrl, startPage);
+
+// Персистентно (между отделни run-ове на актьора) хранилище с URL адресите
+// на дилърите, на които вече е изпратено запитване през контактната форма —
+// за да не се пращат дублирани съобщения при последващи пускания.
+const contactedStore = await Actor.openKeyValueStore('bgdealers-contacted-urls');
+let contactedUrls = new Set();
+if (resetContactedHistory) {
+    await contactedStore.setValue('contactedUrls', []);
+    log.info('Историята на вече контактуваните дилъри е изчистена за този run.');
+} else {
+    const storedContacted = await contactedStore.getValue('contactedUrls');
+    if (Array.isArray(storedContacted)) contactedUrls = new Set(storedContacted);
+    if (contactedUrls.size > 0) {
+        log.info(`Заредена история: ${contactedUrls.size} дилъра вече са контактувани в предходни run-ове.`);
+    }
+}
 
 /**
  * ---------------------------------------------------------------------------
@@ -113,7 +143,7 @@ const listingCrawler = new CheerioCrawler({
 
 // Decide whether to crawl the listings or use provided `dealerUrls`.
 if (mode === 'scrape' || mode === 'both' || (mode === 'send' && (!dealerUrls || dealerUrls.length === 0))) {
-    await listingCrawler.run([startUrl]);
+    await listingCrawler.run([effectiveStartUrl]);
     log.info(`Намерени ${dealerLinks.size} уникални дилъра в ${listingPagesVisited} страници от списъка.`);
 }
 
@@ -723,19 +753,38 @@ if (findOfficialWebsite && scrapeEmails) {
 // Optional Phase: submit contact forms on the dealers' contact pages
 // ---------------------------------------------------------------------------
 if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode === 'both')) {
-    log.info(`ФАЗА: Попълване на контактни форми за ${dealerResults.length} дилъра…`);
+    let targets = dealerResults;
 
-    await runWithConcurrency(dealerResults, Math.max(1, Math.floor(maxConcurrency / 2)), async (dealer) => {
+    if (skipAlreadyContacted && contactedUrls.size > 0) {
+        const alreadyContacted = dealerResults.filter((d) => contactedUrls.has(d.dealerUrl));
+        alreadyContacted.forEach((d) => {
+            d.contactForm = { submitted: false, reason: 'already-contacted-previous-run' };
+        });
+        targets = dealerResults.filter((d) => !contactedUrls.has(d.dealerUrl));
+        if (alreadyContacted.length > 0) {
+            log.info(`Прескочени ${alreadyContacted.length} дилъра, на които вече е изпратено запитване в предходен run.`);
+        }
+    }
+
+    log.info(`ФАЗА: Попълване на контактни форми за ${targets.length} дилъра…`);
+
+    await runWithConcurrency(targets, Math.max(1, Math.floor(maxConcurrency / 2)), async (dealer) => {
         try {
             const res = await submitContactFormWithPlaywright(dealer.contactsUrl, contactFormData, captchaApiKey, formSubmitTimeoutMs);
             dealer.contactForm = res;
+            if (res && res.submitted) {
+                contactedUrls.add(dealer.dealerUrl);
+            }
         } catch (err) {
             dealer.contactForm = { submitted: false, reason: err.message };
         }
     });
 
-    const submittedCount = dealerResults.filter((d) => d.contactForm && d.contactForm.submitted).length;
+    const submittedCount = targets.filter((d) => d.contactForm && d.contactForm.submitted).length;
     log.info(`Успешно подадени форми за ${submittedCount} дилъра.`);
+
+    // Записваме обновения списък с контактувани дилъри за следващи run-ове.
+    await contactedStore.setValue('contactedUrls', [...contactedUrls]);
 }
 
 /**
