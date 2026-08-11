@@ -1,13 +1,13 @@
 {
   "name": "mobile-bg-dealers-scraper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Apify actor: scrapes dealer names and phone numbers from mobile.bg/dealers by visiting each dealer's Контакти (Contacts) page.",
-  "main": "src/main.js",
+  "description": "Apify actor: scrapes Mobile.bg dealers and reliably submits dealer contact forms with CAPTCHA support.",
+  "main": "src/main-v2.js",
   "scripts": {
-    "start": "node src/main.js",
-    "start:dev": "node src/main.js",
-    "start:local": "node local_main.js local_input.json",
+    "start": "node src/main-v2.js",
+    "start:dev": "node src/main-v2.js",
+    "start:local": "node src/main-v2.js",
     "start:web": "node web.js"
   },
   "dependencies": {
