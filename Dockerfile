@@ -5,13 +5,18 @@ FROM apify/actor-node-playwright-chrome:20-1.59.1
 # apify/actor-node:20 (обикновената база) НЯМА тези неща и затова
 # playwright.chromium.launch() гърмеше мигновено за всеки дилър.
 #
-# ВАЖНО: тагът на този image е закован към точна версия на Playwright
-# (1.59.1), а не просто "20" (която сочи към каквато версия е най-нова
-# към момента на build-а). package.json трябва да декларира СЪЩАТА точна
-# версия ("playwright": "1.59.1"), иначе npm install ще дръпне различна
-# версия на playwright пакета, чийто очакван път до Chromium binary-я
-# (номериран по ревизия) няма да съвпада с вече инсталирания в image-а —
-# точно грешката "Executable doesn't exist at /pw-browsers/...".
+# ВАЖНО: дори версиите на Playwright пакета и на base image-а да съвпадат
+# точно, Playwright >=1.58 в Docker среда има известен бъг/промяна в
+# поведението: chromium.launch({headless:true}) очаква отделен, по-малък
+# browser build ("chrome-headless-shell"), който на моменти липсва или е
+# с различна ревизия от вече вградения в image-а глобален кеш
+# (/pw-browsers) — виж microsoft/playwright issue #39122. Затова НЕ
+# разчитаме на вградения кеш, а изрично сваляме браузъра по време на
+# build, локално в проекта (PLAYWRIGHT_BROWSERS_PATH=0 -> сваля вътре в
+# node_modules/playwright-core/.local-browsers, независимо от глобалния
+# кеш и неговата версия/ревизия).
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+ENV PLAYWRIGHT_BROWSERS_PATH=0
 #
 # Тази база работи с non-root потребител "myuser" (работна директория
 # /home/myuser), затова копираните файлове трябва изрично да се дадат
@@ -20,6 +25,7 @@ FROM apify/actor-node-playwright-chrome:20-1.59.1
 
 COPY --chown=myuser:myuser package*.json ./
 RUN npm install --omit=dev --omit=optional \
+    && npx playwright install chromium \
     && echo "Installed NPM packages:" \
     && (npm list --omit=dev --all || true) \
     && echo "Node.js version:" \
