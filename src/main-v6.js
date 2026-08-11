@@ -58,28 +58,34 @@ async function solveLocallyConsensus(imageBase64) {
     const started = Date.now();
     try {
         const source = Buffer.from(imageBase64, 'base64');
-        const [variantA, variantB] = await Promise.all([
-            prepareVariant(source, null),
-            prepareVariant(source, 150),
-        ]);
 
-        const [a, b] = await Promise.all([
-            recognizeVariant(variantA),
-            recognizeVariant(variantB),
-        ]);
-
+        // First pass: normalized grayscale. If it is extremely confident and exactly
+        // six alphanumeric characters, use it immediately and avoid a second OCR job.
+        const variantA = await prepareVariant(source, null);
+        const a = await recognizeVariant(variantA);
         const aValid = /^[A-Za-z0-9]{6}$/.test(a.text);
+
+        if (aValid && a.confidence >= 94) {
+            const elapsedMs = Date.now() - started;
+            console.log(`INFO  [Local OCR] A="${a.text}" (${a.confidence.toFixed(0)}%), elapsed=${elapsedMs}ms, result=ACCEPT ${a.text} (very-high-confidence-pass-a)`);
+            return a.text;
+        }
+
+        // Second pass is only created when needed, which keeps memory usage lower when
+        // two Chromium browsers are active in parallel.
+        const variantB = await prepareVariant(source, 150);
+        const b = await recognizeVariant(variantB);
         const bValid = /^[A-Za-z0-9]{6}$/.test(b.text);
+
         let accepted = null;
         let reason = 'no-consensus';
-
         if (aValid && bValid && a.text === b.text) {
             accepted = a.text;
             reason = 'two-pass-consensus';
-        } else if (aValid && a.confidence >= 88) {
+        } else if (aValid && a.confidence >= 90) {
             accepted = a.text;
             reason = 'high-confidence-pass-a';
-        } else if (bValid && b.confidence >= 88) {
+        } else if (bValid && b.confidence >= 90) {
             accepted = b.text;
             reason = 'high-confidence-pass-b';
         }
