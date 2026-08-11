@@ -511,7 +511,13 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         solveValue: null,     // решението, което сме подали (текст/token) — за debug
         passed: null,          // true/false/null(неясно) — попълва се накрая, след submit
     };
-    const browser = await playwright.chromium.launch({ headless: true });
+    let browser;
+    try {
+        browser = await playwright.chromium.launch({ headless: true });
+    } catch (err) {
+        log.error(`[Playwright] ${dealerHost}: НЕ успях да стартирам Chromium браузъра — ${err.message}. Най-честата причина: Docker image-ът не съдържа инсталиран Chromium (виж Dockerfile).`);
+        return { status: 'failed', submitted: false, success: false, reason: `browser-launch-failed: ${err.message}`, captcha: captchaInfo };
+    }
     const context = await browser.newContext();
     const page = await context.newPage();
     try {
@@ -843,7 +849,8 @@ if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode ==
                 contactedUrls.add(dealer.dealerUrl);
             }
         } catch (err) {
-            dealer.contactForm = { submitted: false, reason: err.message };
+            log.error(`[Contact form] Неочаквана грешка за ${dealer.dealerUrl}: ${err.message}`);
+            dealer.contactForm = { status: 'failed', submitted: false, success: false, reason: err.message };
         }
     });
 
