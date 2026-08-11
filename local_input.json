@@ -2,12 +2,15 @@
   "mode": "send",
   "dealerUrls": ["https://atlanticdrive.mobile.bg"],
   "submitContactForm": true,
-  "contactFormData": {
-    "name": "Тест Тестов",
-    "email": "test@example.com",
-    "message": "Здравейте, това е тестово съобщение."
-  },
+  "skipAlreadyContacted": false,
+  "contactName": "Тест Тестов",
+  "contactPhone": "0888000000",
+  "contactEmail": "test@example.com",
+  "contactSubject": "Тест",
+  "contactMessage": "Здравейте, това е тестово съобщение.",
   "captchaApiKey": null,
   "debugSaveCaptcha": true,
-  "maxConcurrency": 2
+  "maxConcurrency": 2,
+  "maxBrowserConcurrency": 1,
+  "formSubmitTimeoutMs": 60000
 }
