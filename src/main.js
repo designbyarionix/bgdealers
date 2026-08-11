@@ -480,18 +480,31 @@ async function solveImageCaptchaOCR(imageBase64) {
 }
 
 async function detectSubmitResult(page) {
-    const content = (await page.content()).replace(/\s+/g, ' ').trim().toLowerCase();
+    // ВАЖНО: използваме реално ВИДИМИЯ текст на страницата (innerText),
+    // а не суровия HTML markup (page.content()). Суровият HTML съдържа
+    // <script>/<style> съдържание, мета тагове, скрити елементи и т.н.,
+    // където общи думи като "грешка"/"моля" се появяват почти навсякъде
+    // (напр. в analytics скриптове, placeholder-и на самата форма още
+    // преди изобщо да е подадена) — това водеше до фалшиво "failed" за
+    // абсолютно всеки резултат, независимо какво реално се е случило.
+    const visibleText = await page.innerText('body').catch(() => '');
+    const content = visibleText.replace(/\s+/g, ' ').trim().toLowerCase();
+
+    // Само специфични, недвусмислени фрази — избягваме единични общи
+    // думи (като самотното "моля" или "грешка"), които се срещат в
+    // почти всякакъв текст по сайтовете, независимо от резултата.
     const successPatterns = [
-        /изпратен[оa]?/, /успешн[оa]?/, /благодарим/, /thank you/, /your message/, /съобщението е изпратено/, /заявката е получена/, /вече е изпратено/,
-        /вашето (запитване|съобщение) (е )?изпратен[оa]?/, /съобщението беше изпратено/, /успешно изпратено/, /благодарим ви/, /thank you for/, /message has been sent/
+        /благодарим/, /успешно изпратен/, /съобщението (ви )?е изпратено/, /запитването (ви )?е изпратено/,
+        /вашето съобщение беше изпратено/, /заявката (ви )?е получена/, /message has been sent/i, /thank you for your (message|inquiry)/i,
     ];
     const errorPatterns = [
-        /грешк[аие]*/i, /не( е)? изпратено/, /неуспешн[оa]?/, /captcha/i, /грешен/, /невалидн[аои]?/, /моля/, /попълн[ете]?/, /код за потвърждение/, /please fill/, /invalid/, /failed/, /error/
+        /грешен код/, /невалиден код/, /кодът не съвпада/, /грешна captcha/i, /невалидна captcha/i,
+        /моля,? опитайте отново/, /please try again/i, /invalid captcha/i, /captcha.{0,15}(грешен|невалид|failed)/i,
     ];
     const url = page.url().toLowerCase();
     const formStillVisible = await page.$('form').then(Boolean).catch(() => false);
-    const hasSuccess = successPatterns.some((re) => re.test(content)) || /thank-you|thanks|success|successful/.test(url);
-    const hasError = errorPatterns.some((re) => re.test(content)) || /error|failed|неуспешн[оa]?/.test(url);
+    const hasSuccess = successPatterns.some((re) => re.test(content)) || /thank-you|thanks-for/.test(url);
+    const hasError = errorPatterns.some((re) => re.test(content));
     return {
         pageTextSnippet: content.slice(0, 500),
         isSuccess: hasSuccess,
@@ -684,6 +697,15 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
                         await browser.close();
                         return { status: 'failed', submitted: false, success: false, reason: 'image-captcha-present-no-api-key-or-ocr-empty', captcha: captchaInfo };
                     }
+                    if (solved.length > 12) {
+                        // Капчите на mobile.bg обикновено са ~6 символа. OCR резултат,
+                        // много по-дълъг от това, почти сигурно означава, че OCR-ът е
+                        // разчел и шума на фона като допълнителни "букви" — резултатът
+                        // е боклук и подаването му само ще похаби опит без шанс за успех.
+                        log.warning(`[Captcha] ${dealerHost}: OCR резултатът изглежда невалиден (твърде дълъг: "${solved}") — вероятно е разчел шума на фона, не реалния текст. Прескачам без да пробвам да го подам.`);
+                        await browser.close();
+                        return { status: 'failed', submitted: false, success: false, reason: 'image-captcha-ocr-garbage-result', captcha: captchaInfo };
+                    }
                 }
 
                 // Try to find input for the captcha code and fill it
@@ -764,6 +786,9 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
         } else {
             status = 'unknown-clicked';
         }
+
+        const statusLabel = status === 'sent' ? 'ИЗПРАТЕНО' : status === 'failed' ? 'НЕУСПЕШНО' : 'НЕЯСНО';
+        log.info(`[Форма] ${dealerHost}: резултат=${statusLabel} | текст от страницата: "${submitResult.pageTextSnippet.slice(0, 200)}${submitResult.pageTextSnippet.length > 200 ? '…' : ''}"`);
 
         // Определяме дали капчата реално е минала, въз основа на финалния
         // резултат от страницата (само ако изобщо е имало капча за тази форма).
