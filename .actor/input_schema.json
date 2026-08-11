@@ -39,6 +39,15 @@
       "default": 10,
       "editor": "number"
     },
+    "maxBrowserConcurrency": {
+      "title": "Максимален брой едновременни браузъри (при изпращане на форми)",
+      "type": "integer",
+      "description": "Колко Chromium браузъра да работят паралелно при попълване/изпращане на контактни форми. Всеки браузър използва значителна памет (~300-500MB) — твърде високо число може да доведе до 'Killed' (out of memory) в контейнера. Ако виждаш 'Killed' в лога, намали тази стойност на 1-2 или увеличи заделената памет за актьора от Settings в Apify Console.",
+      "default": 2,
+      "minimum": 1,
+      "maximum": 10,
+      "editor": "number"
+    },
     "findOfficialWebsite": {
       "title": "Търсене на официален уебсайт в Google",
       "type": "boolean",

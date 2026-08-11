@@ -14,6 +14,7 @@ const {
     maxListingPages = 0, // 0 = без лимит
     maxDealers = 0, // 0 = без лимит
     maxConcurrency = 10,
+    maxBrowserConcurrency = 2,
     findOfficialWebsite = false,
     scrapeEmails = false,
     googleSearchCountryCode = 'bg',
@@ -513,7 +514,17 @@ async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKey
     };
     let browser;
     try {
-        browser = await playwright.chromium.launch({ headless: true });
+        browser = await playwright.chromium.launch({
+            headless: true,
+            args: [
+                '--disable-dev-shm-usage', // /dev/shm в контейнери е малък (обикновено 64MB) — тази опция кара Chrome да ползва диск вместо да гърми
+                '--disable-gpu',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-extensions',
+                '--disable-background-networking',
+            ],
+        });
     } catch (err) {
         log.error(`[Playwright] ${dealerHost}: НЕ успях да стартирам Chromium браузъра — ${err.message}. Най-честата причина: Docker image-ът не съдържа инсталиран Chromium (виж Dockerfile).`);
         return { status: 'failed', submitted: false, success: false, reason: `browser-launch-failed: ${err.message}`, captcha: captchaInfo };
@@ -839,9 +850,9 @@ if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode ==
         }
     }
 
-    log.info(`ФАЗА: Попълване на контактни форми за ${targets.length} дилъра…`);
+    log.info(`ФАЗА: Попълване на контактни форми за ${targets.length} дилъра (максимум ${maxBrowserConcurrency} браузъра едновременно)…`);
 
-    await runWithConcurrency(targets, Math.max(1, Math.floor(maxConcurrency / 2)), async (dealer) => {
+    await runWithConcurrency(targets, Math.max(1, maxBrowserConcurrency), async (dealer) => {
         try {
             const res = await submitContactFormWithPlaywright(dealer.contactsUrl, contactFormData, captchaApiKey, formSubmitTimeoutMs);
             dealer.contactForm = res;
