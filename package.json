@@ -1,13 +1,13 @@
 {
   "name": "mobile-bg-dealers-scraper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Apify actor: scrapes Mobile.bg dealers and reliably submits dealer contact forms with CAPTCHA support.",
-  "main": "src/main-v2.js",
+  "main": "src/main-v3.js",
   "scripts": {
-    "start": "node src/main-v2.js",
-    "start:dev": "node src/main-v2.js",
-    "start:local": "node src/main-v2.js",
+    "start": "node src/main-v3.js",
+    "start:dev": "node src/main-v3.js",
+    "start:local": "node src/main-v3.js",
     "start:web": "node web.js"
   },
   "dependencies": {
