@@ -1,13 +1,6 @@
 name: Apify Diagnostic
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'package.json'
-      - '.actor/**'
-      - 'Dockerfile'
   workflow_dispatch:
 
 permissions:
