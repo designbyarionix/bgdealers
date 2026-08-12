@@ -1,9 +1,13 @@
 name: Apify Diagnostic
 
-# Existing workflow; this commit intentionally triggers the first push run.
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - '.actor/**'
+      - 'Dockerfile'
   workflow_dispatch:
 
 permissions:
@@ -24,10 +28,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Wait for Apify GitHub build sync
-        run: sleep 35
-
-      - name: Run one-dealer Apify diagnostic
+      - name: Build and run one-dealer Apify diagnostic
         run: node .github/scripts/apify-diagnostic.mjs
 
       - name: Upload Apify log
