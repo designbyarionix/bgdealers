@@ -1,0 +1,39 @@
+name: Apify Diagnostic
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-actor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Wait for Apify GitHub build sync
+        run: sleep 35
+
+      - name: Run one-dealer Apify diagnostic
+        run: node .github/scripts/apify-diagnostic.mjs
+
+      - name: Upload Apify log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apify-run-log
+          path: apify-run.log
+          if-no-files-found: ignore
+          retention-days: 3
