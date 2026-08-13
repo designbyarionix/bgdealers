@@ -1,4 +1,4 @@
-node_modules
-storage
-apify_storage
-.DS_Store
+node_modules/
+storage/
+.env
+*.zip

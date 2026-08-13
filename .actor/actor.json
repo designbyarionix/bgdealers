@@ -1,10 +1,10 @@
 {
   "actorSpecification": 1,
-  "name": "mobile-bg-dealers-scraper",
-  "title": "Mobile.bg Dealers & Phone Scraper",
-  "description": "Обхожда https://www.mobile.bg/dealers, събира всички дилъри, влиза в сайта на всеки дилър, отваря страницата 'Контакти', попълва контактна форма и изпраща съобщение, както и извлича телефонния номер, адреса и името на дилъра.",
-  "version": "0.1",
-  "input": "./input_schema.json",
+  "name": "mobile-bg-dealer-outreach",
+  "title": "Mobile.bg Dealer Outreach",
+  "description": "Sends duplicate-safe outreach to Mobile.bg dealers using 2Captcha.",
+  "version": "1.0",
+  "buildTag": "latest",
   "dockerfile": "../Dockerfile",
-  "readme": "../README.md"
+  "input": "./input_schema.json"
 }

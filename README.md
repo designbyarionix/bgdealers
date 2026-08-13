@@ -1,121 +1,54 @@
-# mobile-bg-dealers-scraper
+# Mobile.bg Dealer Outreach Actor
 
-Apify Actor, който скрейпва **реално** дилъри и телефонни номера от
-[mobile.bg/dealers](https://www.mobile.bg/dealers).
+Apify Actor that discovers Mobile.bg dealer profiles, contacts at most 50 new dealers per day, solves Mobile.bg image CAPTCHAs through 2Captcha, and permanently prevents duplicates by both dealer domain and phone number.
 
-## Как работи (точно потокът, който описа)
+## Safety and duplicate rules
 
-1. **Фаза 1 — списък с дилъри.** Отваря `https://www.mobile.bg/dealers` и следва
-   пагинацията (линка "Напред" / `/dealers/p-N`) докато свърши. От всяка
-   страница събира линковете към под-домейните на всеки дилър (напр.
-   `https://atlanticdrive.mobile.bg`), защото това е адресът, на който се
-   озоваваш, когато **натиснеш върху дилъра**.
-2. **Фаза 2 — контакти.** За всеки дилър отваря `{дилър}/contacts` — това е
-   точно страницата, на която сайтът на mobile.bg завежда бутона
-   **"Контакти"**. Оттам изважда:
-   - име на дилъра
-   - телефонен(и) номер(а)
-   - адрес и кореспондентски адрес
-   - от коя година е в mobile.bg
-3. **Фаза 3 (опционална, `findOfficialWebsite`) — официален уебсайт чрез
-   Google.** За всеки дилър се пуска готовият, официален Apify актор
-   [`apify/google-search-scraper`](https://apify.com/apify/google-search-scraper)
-   (не се прави Google scraping от нулата) със заявка от типа
-   `"Име на дилъра" автокъща`. От органичните резултати се взима първият, чийто
-   домейн не е mobile.bg, Facebook, Instagram, OLX, Bazar.bg и т.н. — това се
-   записва като `officialWebsite`. Всички заявки за всички дилъри се пращат в
-   **едно** извикване на актора (batch), за да е ефективно.
-4. **Фаза 4 (опционална, `scrapeEmails`) — имейли от намерения сайт.** Ако е
-   намерен официален уебсайт, actor-ът влиза в него, търси mailto: линкове и
-   имейл адреси в текста, а ако не намери нищо на началната страница — опитва
-   да засече линк към "Контакти"/"За нас" и проверява и там.
-5. Резултатите се пишат в Apify Dataset (един запис на дилър), достъпни в
-   табличен вид, JSON, CSV, Excel и т.н.
+- `sendMessages` defaults to `false`. The first run is a dry run.
+- Only a form response containing `Запитването е изпратено.` counts as sent.
+- Successfully contacted domains are saved permanently in the named key-value store `mobile-bg-outreach-state`.
+- Successfully contacted phone numbers are also saved. Another profile with the same phone is skipped permanently.
+- Four dealers contacted manually before this Actor was created are included in the initial seed list.
+- The four successful manual messages from 2026-08-13 are also seeded into that day's counter, leaving 46 available successful sends for the first live Actor run that day.
+- A per-timezone daily counter prevents more than `dailySuccessfulLimit` successful messages, even if the Actor runs more than once in a day.
+- Failed CAPTCHA attempts are logged but not marked as sent.
 
-Реализирано е с `CheerioCrawler` (без headless браузър), защото сайтът е
-сървърно рендериран — HTML-ът, който вижда crawler-ът, е същият, който виждаш
-в браузъра, преди JS да е изпълнен.
+## Deploy to Apify
 
-## Вход (Input)
+1. Create a new Actor in Apify Console and choose **Empty Actor**.
+2. Upload this project or connect its Git repository.
+3. Build the Actor.
+4. Open **Input**, paste your current 2Captcha key into **2Captcha API key**, and save the task/input. The field is declared with `isSecret: true`, so Apify encrypts it.
+5. Keep **Send messages** disabled for the first run. Check the Dataset for `dry_run_ready` records.
+6. Enable **Send messages** only after the dry-run recipient list looks correct.
+7. In **Schedules**, create one daily schedule. The Actor itself enforces the maximum of 50 successful submissions per day.
 
-| Поле | По подразбиране | Описание |
-|---|---|---|
-| `startUrl` | `https://www.mobile.bg/dealers` | Начална страница със списъка |
-| `maxListingPages` | `0` (без лимит) | Колко страници от списъка да обходи |
-| `maxDealers` | `0` (без лимит) | Колко дилъра да скрейпне (за тестове) |
-| `maxConcurrency` | `10` | Паралелни заявки към страниците "Контакти" |
-| `findOfficialWebsite` | `false` | Търси официалния уебсайт на всеки дилър през `apify/google-search-scraper` |
-| `scrapeEmails` | `false` | Работи само ако `findOfficialWebsite` е включено — вади имейли от намерения сайт |
-| `googleSearchCountryCode` | `bg` | Държава за Google търсенето |
-| `googleSearchLanguageCode` | `bg` | Език за Google търсенето |
+Do not put the 2Captcha key in source code, Git, Dockerfile, README, or ordinary non-secret environment variables.
 
-Пример за тестов input (само 5 дилъра + търсене на сайт + имейли):
+## Run locally
 
-```json
-{
-  "maxDealers": 5,
-  "findOfficialWebsite": true,
-  "scrapeEmails": true
-}
-```
-
-## Изход (пример за един запис в Dataset)
-
-```json
-{
-  "dealerName": "ATLANTIC DRIVE - Внос на леки автомобили, джипове и лек транспорт.",
-  "dealerUrl": "https://atlanticdrive.mobile.bg",
-  "contactsUrl": "https://atlanticdrive.mobile.bg/contacts",
-  "phones": ["0878119140"],
-  "address": "гр. София, Столична община",
-  "correspondenceAddress": "Столична община, ул. Съборна поляна №38",
-  "memberSince": "2025",
-  "officialWebsite": "https://atlantic-drive.example",
-  "emails": ["office@atlantic-drive.example"],
-  "scrapedAt": "2026-08-10T12:00:00.000Z"
-}
-```
-
-## ⚠️ Важно за `findOfficialWebsite`
-
-- Изисква Apify акаунт с наличен баланс/платен план, защото извиква друг
-  платен актор (`apify/google-search-scraper`) от твоя акаунт — струва
-  проксита/SERP заявки, отделно от този actor.
-- Ако извикването се провали (напр. няма достатъчно credits или token), actor-ът
-  не спира целия run — просто продължава без `officialWebsite`/`emails` и пише
-  предупреждение в лога.
-- Домейните в "черния списък" (mobile.bg, Facebook, Instagram, OLX, Bazar.bg,
-  Auto.bg, Cars.bg и др.) са в `src/main.js` → константата `BLACKLISTED_DOMAINS`
-  — добави/махни домейни оттам при нужда.
-
-## Локално стартиране
+Local execution is useful only for tests unless a compatible Chrome/Playwright installation is available.
 
 ```bash
 npm install
+npm test
 npm start
 ```
 
-(По подразбиране Apify SDK пише резултатите в `./storage/datasets/default`.)
+For a local real run, create `storage/key_value_stores/default/INPUT.json` based on the input schema. Never commit that file if it contains an API key.
 
-## Deploy в Apify
+## Output
 
-```bash
-npm install -g apify-cli
-apify login
-apify push
-```
+Each run writes one Dataset record per examined dealer with a status such as:
 
-или качи папката директно през Apify Console → Actors → Create new → Import
-from Git/ZIP.
+- `dry_run_ready`
+- `sent`
+- `skipped_duplicate_phone`
+- `captcha_rejected`
+- `failed`
 
-## Бележки / поддръжка
+The run summary is stored in the default key-value store as `OUTPUT`.
 
-- mobile.bg може да променя HTML структурата си с времето — ако в даден
-  момент телефон не се извлича, най-вероятно маркерите на страницата
-  "Контакти" ("Адрес:", "Кореспондентски адрес:", "в mobile.bg от ... г.") са
-  се променили и трябва да се обнови regex-а в `src/main.js`.
-- Actor-ът пази телефона си като масив (`phones`), защото част от дилърите
-  имат по няколко номера.
-- Скрейпването е с респект към сайта — листващата фаза е нарочно
-  ограничена до 3 паралелни заявки; фазата за контакти е конфигурируема
-  чрез `maxConcurrency`.
+## Notes
+
+The Actor uses Mobile.bg's current contact-form field names (`s0`, `s1`, `s2`, `s3`, `s4`, `accept2`). If Mobile.bg changes its HTML, update these selectors. Use the Actor in compliance with applicable anti-spam, privacy, platform, and commercial-communication rules.

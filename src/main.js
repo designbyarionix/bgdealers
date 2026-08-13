@@ -1,919 +1,266 @@
-import { Actor } from 'apify';
-import { CheerioCrawler, log } from 'crawlee';
-import playwright from 'playwright';
-import Tesseract from 'tesseract.js';
-import sharp from 'sharp';
-import fs from 'fs/promises';
+import { Actor, log } from 'apify';
+import { chromium } from 'playwright';
+import {
+    createEmptyState,
+    dateKey,
+    normalizeDealerUrl,
+    normalizePhone,
+    redactError,
+    remainingDailyAllowance,
+    seedState,
+} from './lib.js';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function twoCaptchaRequest(path, payload) {
+    const response = await fetch(`https://api.2captcha.com/${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+    });
+    const result = await response.json();
+    if (!response.ok || result.errorId) {
+        throw new Error(`2Captcha ${path}: ${result.errorCode || response.status} ${result.errorDescription || ''}`.trim());
+    }
+    return result;
+}
+
+async function solveImageCaptcha(apiKey, imageBuffer) {
+    const created = await twoCaptchaRequest('createTask', {
+        clientKey: apiKey,
+        task: {
+            type: 'ImageToTextTask',
+            body: imageBuffer.toString('base64'),
+            phrase: false,
+            case: true,
+            numeric: 0,
+            math: false,
+            minLength: 6,
+            maxLength: 6,
+            comment: 'Enter all 6 characters exactly. Uppercase and lowercase matter.',
+        },
+        languagePool: 'en',
+    });
+
+    const deadline = Date.now() + 150_000;
+    while (Date.now() < deadline) {
+        await sleep(5_000);
+        const result = await twoCaptchaRequest('getTaskResult', {
+            clientKey: apiKey,
+            taskId: created.taskId,
+        });
+        if (result.status === 'ready') return result.solution.text.trim();
+    }
+    throw new Error('2Captcha timed out after 150 seconds');
+}
+
+async function discoverDealers(page, maxPages, alreadyProcessed, candidateTarget) {
+    const dealers = [];
+    const seen = new Set();
+
+    for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
+        const url = pageNumber === 1
+            ? 'https://www.mobile.bg/dealers'
+            : `https://www.mobile.bg/dealers/p-${pageNumber}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+
+        const hrefs = await page.locator('a[href]').evaluateAll((links) => links.map((link) => link.href));
+        let newOnPage = 0;
+        for (const href of hrefs) {
+            const dealerUrl = normalizeDealerUrl(href);
+            if (!dealerUrl || seen.has(dealerUrl)) continue;
+            seen.add(dealerUrl);
+            newOnPage += 1;
+            if (!alreadyProcessed[dealerUrl]) dealers.push(dealerUrl);
+        }
+
+        log.info(`Scanned dealer page ${pageNumber}`, { candidates: dealers.length });
+        if (newOnPage === 0 || dealers.length >= candidateTarget) break;
+    }
+    return dealers;
+}
+
+async function readDealerIdentity(page, dealerUrl) {
+    await page.goto(`${dealerUrl}/contacts`, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    const hasForm = await page.locator('input[name="s0"], textarea[name="s3"]').count();
+    if (!hasForm) throw new Error('Contact form is missing');
+
+    const dealerName = (await page.locator('h1').first().textContent() || dealerUrl)
+        .replace(/^Контакти\s*-\s*/i, '')
+        .trim();
+    const bodyText = await page.locator('body').innerText();
+    const phoneMatch = bodyText.match(/Контакти с нас[\s\S]{0,160}?(?:\+359|0)[\d\s,-]{8,}/i);
+    const phone = normalizePhone(phoneMatch?.[0] || '');
+    return { dealerName, phone };
+}
+
+async function submitDealerForm(page, input) {
+    await page.locator('input[name="s0"]').fill(input.senderName);
+    await page.locator('input[name="s2"]').fill(input.senderPhone);
+    await page.locator('input[name="s1"]').fill(input.senderEmail);
+    await page.locator('textarea[name="s3"]').fill(input.message);
+    await page.locator('input[name="accept2"]').check();
+
+    for (let attempt = 1; attempt <= input.maxCaptchaAttempts; attempt += 1) {
+        const captcha = page.locator('img[alt="captcha"]').first();
+        await captcha.waitFor({ state: 'visible', timeout: 15_000 });
+        const captchaPng = await captcha.screenshot({ type: 'png' });
+        const solution = await solveImageCaptcha(input.twoCaptchaApiKey, captchaPng);
+
+        await page.locator('input[name="s4"]').fill(solution);
+        await page.getByText('ИЗПРАТИ ЗАПИТВАНЕТО', { exact: true }).click();
+        await page.waitForTimeout(1_200);
+
+        const text = await page.locator('body').innerText();
+        if (text.includes('Запитването е изпратено.')) return { success: true, attempts: attempt };
+        if (!text.includes('ГРЕШЕН КОД.')) {
+            throw new Error(`Unexpected form response: ${text.slice(0, 250)}`);
+        }
+        log.warning(`CAPTCHA rejected; retrying (${attempt}/${input.maxCaptchaAttempts})`);
+    }
+    return { success: false, reason: 'captcha_rejected' };
+}
 
 await Actor.init();
 
-const input = (await Actor.getInput()) ?? {};
-const {
-    startUrl = 'https://www.mobile.bg/dealers',
-    startPage = 1,
-    maxListingPages = 0, // 0 = без лимит
-    maxDealers = 0, // 0 = без лимит
-    maxConcurrency = 10,
-    maxBrowserConcurrency = 2,
-    findOfficialWebsite = false,
-    scrapeEmails = false,
-    googleSearchCountryCode = 'bg',
-    googleSearchLanguageCode = 'bg',
-    // New options for contact form automation
-    submitContactForm = false,
-    skipAlreadyContacted = true,
-    resetContactedHistory = false,
-    contactName = '',
-    contactPhone = '',
-    contactEmail = '',
-    contactSubject = '',
-    contactMessage = '',
-    captchaApiKey = null,
-    formSubmitTimeoutMs = 60000,
-    debugSaveCaptcha = false,
-    // mode: 'scrape' (default) = collect data; 'send' = only submit contact forms;
-    // 'both' = scrape then submit forms.
-    mode = 'scrape',
-    // Optional: supply explicit list of dealer base URLs to operate on instead of crawling
-    dealerUrls = [],
-} = input;
-
-// Сглобяваме обекта, който се подава на попълвача на формата, от отделните
-// плоски полета на входа (name/phone/email/subject/message).
-const contactFormData = {
-    name: contactName,
-    phone: contactPhone,
-    email: contactEmail,
-    subject: contactSubject,
-    message: contactMessage,
+const input = {
+    sendMessages: false,
+    senderName: 'Иван Димитров',
+    senderPhone: '0888008210',
+    senderEmail: 'info@arionix.de',
+    dailySuccessfulLimit: 50,
+    maxDealerPages: 190,
+    delayBetweenDealersMs: 15_000,
+    maxCaptchaAttempts: 2,
+    timeZone: 'Europe/Berlin',
+    stateStoreName: 'mobile-bg-outreach-state',
+    initialProcessedDealerUrls: [],
+    initialProcessedPhones: [],
+    initialSuccessfulDate: '',
+    initialSuccessfulCount: 0,
+    ...(await Actor.getInput() || {}),
 };
 
-// Ако е зададена начална страница > 1, построяваме URL по схемата на
-// пагинацията на mobile.bg (.../dealers/p-N), вместо потребителят да трябва
-// сам да познае/копира адреса на конкретната страница.
-function buildStartUrl(baseUrl, page) {
-    if (!page || page <= 1) return baseUrl;
-    const trimmed = baseUrl.replace(/\/+$/, '');
-    const withoutExistingPage = trimmed.replace(/\/p-\d+$/i, '');
-    return `${withoutExistingPage}/p-${page}`;
-}
-const effectiveStartUrl = buildStartUrl(startUrl, startPage);
-
-// Персистентно (между отделни run-ове на актьора) хранилище с URL адресите
-// на дилърите, на които вече е изпратено запитване през контактната форма —
-// за да не се пращат дублирани съобщения при последващи пускания.
-const contactedStore = await Actor.openKeyValueStore('bgdealers-contacted-urls');
-let contactedUrls = new Set();
-if (resetContactedHistory) {
-    await contactedStore.setValue('contactedUrls', []);
-    log.info('Историята на вече контактуваните дилъри е изчистена за този run.');
-} else {
-    const storedContacted = await contactedStore.getValue('contactedUrls');
-    if (Array.isArray(storedContacted)) contactedUrls = new Set(storedContacted);
-    if (contactedUrls.size > 0) {
-        log.info(`Заредена история: ${contactedUrls.size} дилъра вече са контактувани в предходни run-ове.`);
-    }
+if (input.sendMessages && !input.twoCaptchaApiKey) {
+    throw new Error('twoCaptchaApiKey is required when sendMessages is enabled');
 }
 
-/**
- * ---------------------------------------------------------------------------
- * ФАЗА 1: Обхождаме https://www.mobile.bg/dealers (и пагинацията му) и
- * събираме уникалните под-домейни на дилърите, напр. https://atlanticdrive.mobile.bg
- * ---------------------------------------------------------------------------
- */
-const dealerLinks = new Map(); // url -> name (както е показано в списъка)
-let listingPagesVisited = 0;
+const store = await Actor.openKeyValueStore(input.stateStoreName);
+const state = seedState(
+    (await store.getValue('STATE')) || createEmptyState(),
+    input.initialProcessedDealerUrls,
+    input.initialProcessedPhones,
+);
+const today = dateKey(input.timeZone);
+state.daily[today] ||= {
+    successful: input.initialSuccessfulDate === today
+        ? Number(input.initialSuccessfulCount || 0)
+        : 0,
+};
+const allowance = remainingDailyAllowance(state, today, input.dailySuccessfulLimit);
 
-const listingCrawler = new CheerioCrawler({
-    maxConcurrency: 3,
-    maxRequestRetries: 3,
-    requestHandlerTimeoutSecs: 60,
-    async requestHandler({ request, $, enqueueLinks, log: reqLog }) {
-        listingPagesVisited += 1;
-        reqLog.info(`[Списък] ${request.url} (страница ${listingPagesVisited})`);
+if (allowance === 0) {
+    log.info('Daily successful-message limit is already reached', { today });
+    await Actor.setValue('OUTPUT', { today, allowance: 0, successful: 0, message: 'Daily limit reached' });
+    await Actor.exit();
+}
 
-        // Всеки дилър в списъка има линк към собствения си под-домейн
-        // (напр. https://atlanticdrive.mobile.bg), който се среща по няколко
-        // пъти на страницата (име, лого, "Виж всички обяви"). Събираме ги
-        // уникално по домейн.
-        $('a[href]').each((_, el) => {
-            const href = $(el).attr('href');
-            if (!href) return;
-
-            const m = href.match(/^https?:\/\/([a-z0-9-]+)\.mobile\.bg\/?(?:[?#].*)?$/i);
-            if (!m) return;
-
-            const subdomain = m[1].toLowerCase();
-            if (subdomain === 'www') return; // прескачаме самия www.mobile.bg
-
-            const dealerUrl = `https://${subdomain}.mobile.bg`;
-            const text = $(el).text().trim();
-
-            if (!dealerLinks.has(dealerUrl)) {
-                dealerLinks.set(dealerUrl, text || null);
-            } else if (text && !dealerLinks.get(dealerUrl)) {
-                // допълваме името, ако предният път сме хванали линк без текст (напр. лого)
-                dealerLinks.set(dealerUrl, text);
-            }
-        });
-
-        if (maxListingPages > 0 && listingPagesVisited >= maxListingPages) {
-            reqLog.info('Достигнат е лимитът за страници от списъка, спирам пагинацията.');
-            return;
-        }
-
-        // Пагинация: търсим линк "Напред" или /dealers/p-N
-        let nextHref = $('a')
-            .filter((_, el) => $(el).text().trim().toLowerCase() === 'напред')
-            .attr('href');
-
-        if (!nextHref) {
-            nextHref = $('a[href*="/dealers/p-"]')
-                .attr('href');
-        }
-
-        if (nextHref) {
-            const nextUrl = new URL(nextHref, request.url).toString();
-            await enqueueLinks({ urls: [nextUrl] });
-        }
-    },
-    failedRequestHandler({ request, log: reqLog }) {
-        reqLog.warning(`Провалена страница от списъка: ${request.url}`);
-    },
+const browser = await chromium.launch({ headless: true });
+const context = await browser.newContext({
+    locale: 'bg-BG',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36',
 });
+const page = await context.newPage();
+page.setDefaultTimeout(20_000);
 
-// Decide whether to crawl the listings or use provided `dealerUrls`.
-if (mode === 'scrape' || mode === 'both' || (mode === 'send' && (!dealerUrls || dealerUrls.length === 0))) {
-    await listingCrawler.run([effectiveStartUrl]);
-    log.info(`Намерени ${dealerLinks.size} уникални дилъра в ${listingPagesVisited} страници от списъка.`);
-}
+let successfulThisRun = 0;
+let scannedThisRun = 0;
+const candidateTarget = Math.max(allowance * 4, 100);
 
-let dealerEntries = [];
-if (dealerUrls && dealerUrls.length > 0) {
-    dealerEntries = dealerUrls.map((u) => [u.replace(/\/+$/, ''), null]);
-} else {
-    dealerEntries = [...dealerLinks.entries()]; // [ [url, name], ... ]
-}
-if (maxDealers > 0) {
-    dealerEntries = dealerEntries.slice(0, maxDealers);
-}
-
-/**
- * ---------------------------------------------------------------------------
- * ФАЗА 2: За всеки дилър отваряме {dealerUrl}/contacts (бутонът "Контакти")
- * и извличаме телефон, адрес и дата на регистрация.
- * ---------------------------------------------------------------------------
- */
-const PHONE_REGEX = /(\+359[\s.-]?\d{1,3}[\s.-]?\d{3}[\s.-]?\d{3,4}|0\d{2,3}[\s.-]?\d{3}[\s.-]?\d{3,4})/g;
-
-function cleanPhone(raw) {
-    return raw.replace(/[\s.-]/g, '');
-}
-
-function extractBetween(text, startMarker, endMarkers) {
-    const startIdx = text.indexOf(startMarker);
-    if (startIdx === -1) return null;
-    let sliceStart = startIdx + startMarker.length;
-    let sliceEnd = text.length;
-    for (const marker of endMarkers) {
-        const idx = text.indexOf(marker, sliceStart);
-        if (idx !== -1 && idx < sliceEnd) sliceEnd = idx;
-    }
-    const value = text.slice(sliceStart, sliceEnd).trim();
-    return value || null;
-}
-
-let dealerResults = [];
-
-const contactsCrawler = new CheerioCrawler({
-    maxConcurrency,
-    maxRequestRetries: 2,
-    requestHandlerTimeoutSecs: 60,
-    async requestHandler({ request, $, log: reqLog }) {
-        const { dealerUrl, listedName } = request.userData;
-
-        const pageText = $.root().text().replace(/[ \t]+/g, ' ').replace(/\n+/g, '\n').trim();
-
-        // Име на дилъра: заглавието на страницата е "Контакти - <Име>"
-        let dealerName = $('h1').first().text().trim();
-        dealerName = dealerName.replace(/^Контакти\s*-\s*/i, '').trim();
-        if (!dealerName) dealerName = listedName || null;
-
-        const phonesRaw = pageText.match(PHONE_REGEX) || [];
-        const phones = [...new Set(phonesRaw.map(cleanPhone))];
-
-        const address = extractBetween(pageText, 'Адрес:', ['Кореспондентски адрес:', 'Обяви', 'Изпратете', 'За да се свържете', 'Powered by']);
-        const correspondenceAddress = extractBetween(
-            pageText,
-            'Кореспондентски адрес:',
-            ['Обяви', 'Изпратете', 'За да се свържете', 'Powered by'],
-        );
-
-        // Защитна мярка: ако маркерите липсват, не позволяваме адресът да
-        // "погълне" целия остатък на страницата.
-        const trimTo200 = (v) => (v && v.length > 200 ? `${v.slice(0, 200).trim()}…` : v);
-
-        const memberSinceMatch = pageText.match(/в mobile\.bg\s+от\s+(\d{4})\s*г\./i);
-        const memberSince = memberSinceMatch ? memberSinceMatch[1] : null;
-
-        const result = {
-            dealerName,
-            dealerUrl,
-            contactsUrl: request.url,
-            phones,
-            address: trimTo200(address),
-            correspondenceAddress: trimTo200(correspondenceAddress),
-            memberSince,
-            officialWebsite: null,
-            emails: [],
-            scrapedAt: new Date().toISOString(),
-        };
-
-        if (phones.length === 0) {
-            reqLog.warning(`Не е намерен телефон за ${dealerUrl} — записвам все пак с празен масив.`);
-        }
-
-        dealerResults.push(result);
-    },
-    failedRequestHandler({ request, log: reqLog }) {
-        reqLog.warning(`Провалена страница с контакти: ${request.url}`);
-    },
-});
-
-if (mode === 'scrape' || mode === 'both') {
-    await contactsCrawler.run(
-        dealerEntries.map(([dealerUrl, listedName]) => ({
-            url: `${dealerUrl}/contacts`,
-            userData: { dealerUrl, listedName },
-        })),
+try {
+    const candidates = await discoverDealers(
+        page,
+        input.maxDealerPages,
+        state.processedDealers,
+        candidateTarget,
     );
 
-    log.info(`Извлечени контакти за ${dealerResults.length} дилъра.`);
-} else {
-    // mode === 'send' and dealerEntries provided: prepare minimal dealerResults
-    dealerResults = dealerEntries.map(([dealerUrl, listedName]) => ({
-        dealerName: listedName || null,
-        dealerUrl,
-        contactsUrl: `${dealerUrl.replace(/\/+$/, '')}/contacts`,
-        phones: [],
-        address: null,
-        correspondenceAddress: null,
-        memberSince: null,
-        officialWebsite: null,
-        emails: [],
-        scrapedAt: new Date().toISOString(),
-    }));
-    log.info(`Подготвени ${dealerResults.length} дилъра за подадени съобщения (режим send).`);
-}
+    for (const dealerUrl of candidates) {
+        if (successfulThisRun >= allowance) break;
+        scannedThisRun += 1;
 
-/**
- * ---------------------------------------------------------------------------
- * ФАЗА 3 (опционална): Търсене на официалния уебсайт на всеки дилър в Google.
- * Използваме готовия официален Apify актор "apify/google-search-scraper" —
- * не правим Google scraping от нулата.
- * ---------------------------------------------------------------------------
- */
-const BLACKLISTED_DOMAINS = [
-    'mobile.bg',
-    'facebook.com',
-    'instagram.com',
-    'tiktok.com',
-    'youtube.com',
-    'linkedin.com',
-    'olx.bg',
-    'bazar.bg',
-    'imot.bg',
-    'auto.bg',
-    'cars.bg',
-    'google.com',
-    'g.page',
-    'goo.gl',
-    'zlatnistranici.bg',
-    'wikipedia.org',
-    'apify.com',
-];
-
-function isBlacklisted(urlString) {
-    try {
-        const host = new URL(urlString).hostname.replace(/^www\./, '').toLowerCase();
-        return BLACKLISTED_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
-    } catch {
-        return true; // невалиден URL -> третираме като неизползваем
-    }
-}
-
-if (findOfficialWebsite && dealerResults.length > 0) {
-    log.info('ФАЗА 3: Търсене на официални уебсайтове чрез apify/google-search-scraper…');
-
-    const dealersWithName = dealerResults.filter((d) => d.dealerName);
-    const queries = dealersWithName.map((d) => `"${d.dealerName}" автокъща`);
-
-    try {
-        const searchRun = await Actor.call('apify/google-search-scraper', {
-            queries: queries.join('\n'),
-            resultsPerPage: 10,
-            maxPagesPerQuery: 1,
-            countryCode: googleSearchCountryCode,
-            languageCode: googleSearchLanguageCode,
-        });
-
-        const searchDataset = await Actor.openDataset(searchRun.defaultDatasetId, { forceCloud: true });
-        const { items: searchItems } = await searchDataset.getData();
-
-        // Мапваме резултата обратно към дилъра по точния текст на заявката.
-        const queryToDealer = new Map();
-        dealersWithName.forEach((d, i) => queryToDealer.set(queries[i], d));
-
-        for (const item of searchItems) {
-            const term = item?.searchQuery?.term;
-            if (!term) continue;
-            const dealer = queryToDealer.get(term);
-            if (!dealer) continue;
-
-            const organicResults = item.organicResults || [];
-            const firstGood = organicResults.find((r) => r?.url && !isBlacklisted(r.url));
-            if (firstGood) {
-                dealer.officialWebsite = firstGood.url;
-            }
-        }
-
-        const foundCount = dealerResults.filter((d) => d.officialWebsite).length;
-        log.info(`Намерени официални уебсайтове за ${foundCount} от ${dealersWithName.length} дилъра.`);
-    } catch (err) {
-        log.warning(`Търсенето в Google се провали: ${err.message}. Продължавам без официални уебсайтове.`);
-    }
-}
-
-/**
- * ---------------------------------------------------------------------------
- * ФАЗА 4 (опционална): Влизаме в намерения официален уебсайт и извличаме
- * имейл адреси (mailto: линкове + regex по видимия текст).
- * ---------------------------------------------------------------------------
- */
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-const GENERIC_JUNK_EMAILS = new Set(['example@example.com', 'name@example.com', 'you@example.com']);
-
-async function fetchHtml(url, timeoutMs = 15000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const res = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; DealerEmailBot/1.0)',
-                Accept: 'text/html,application/xhtml+xml',
-            },
-            redirect: 'follow',
-        });
-        if (!res.ok) return null;
-        return await res.text();
-    } catch {
-        return null;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-function extractEmailsFromHtml(html) {
-    if (!html) return [];
-    const mailtoMatches = [...html.matchAll(/mailto:([^"'\s?>]+)/gi)].map((m) => m[1]);
-    const textMatches = html.match(EMAIL_REGEX) || [];
-    const all = [...mailtoMatches, ...textMatches]
-        .map((e) => e.trim().toLowerCase())
-        .filter((e) => e && !GENERIC_JUNK_EMAILS.has(e) && !e.endsWith('.png') && !e.endsWith('.jpg'));
-    return [...new Set(all)];
-}
-
-async function findContactPageUrl(baseUrl, html) {
-    if (!html) return null;
-    const hrefMatches = [...html.matchAll(/href=["']([^"']+)["']/gi)].map((m) => m[1]);
-    // Първо търсим директно "контакти"/"contact", после падаме към "за нас"/"about"
-    const candidate = hrefMatches.find((h) => /kontakt|contact/i.test(h))
-        || hrefMatches.find((h) => /za-nas|about/i.test(h));
-    if (!candidate) return null;
-    try {
-        return new URL(candidate, baseUrl).toString();
-    } catch {
-        return null;
-    }
-}
-
-// -------------------------
-// Playwright form filler + 2captcha support
-// -------------------------
-
-async function solveRecaptcha2(sitekey, pageUrl, apiKey, timeoutMs = 120000) {
-    if (!apiKey) throw new Error('No 2captcha API key provided');
-    const params = new URLSearchParams({
-        key: apiKey,
-        method: 'userrecaptcha',
-        googlekey: sitekey,
-        pageurl: pageUrl,
-        json: '1',
-    });
-    const inRes = await fetch(`http://2captcha.com/in.php?${params.toString()}`);
-    const inJson = await inRes.json();
-    if (!inJson || inJson.status !== 1) throw new Error(`2captcha in.php error: ${JSON.stringify(inJson)}`);
-    const requestId = inJson.request;
-
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-        await new Promise((r) => setTimeout(r, 5000));
-        const res = await fetch(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${requestId}&json=1`);
-        const body = await res.json();
-        if (body.status === 1 && body.request) return body.request;
-        if (body.request && body.request.includes('ERROR')) throw new Error(`2captcha error: ${body.request}`);
-    }
-    throw new Error('2captcha timeout waiting for solution');
-}
-
-async function solveImageCaptcha2(imageBase64, apiKey, timeoutMs = 120000) {
-    if (!apiKey) throw new Error('No 2captcha API key provided');
-
-    const params = new URLSearchParams({
-        method: 'base64',
-        key: apiKey,
-        body: imageBase64,
-        json: '1',
-    });
-
-    const inRes = await fetch('http://2captcha.com/in.php', {
-        method: 'POST',
-        body: params,
-    });
-    const inJson = await inRes.json();
-    if (!inJson || inJson.status !== 1) throw new Error(`2captcha in.php error: ${JSON.stringify(inJson)}`);
-    const requestId = inJson.request;
-
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-        await new Promise((r) => setTimeout(r, 5000));
-        const res = await fetch(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${requestId}&json=1`);
-        const body = await res.json();
-        if (body.status === 1 && body.request) return body.request;
-        if (body.request && body.request.includes('ERROR')) throw new Error(`2captcha error: ${body.request}`);
-    }
-    throw new Error('2captcha timeout waiting for image solution');
-}
-
-async function solveImageCaptchaOCR(imageBase64) {
-    try {
-        const buffer = Buffer.from(imageBase64, 'base64');
-        // Preprocess image: grayscale, upscale, normalize, threshold
-        const img = sharp(buffer);
-        const meta = await img.metadata();
-        const width = meta.width || 200;
-        const processed = await img
-            .grayscale()
-            .resize(Math.min(1000, Math.max(200, Math.round(width * 2))))
-            .normalise()
-            .threshold(140)
-            .toBuffer();
-
-        const res = await Tesseract.recognize(processed, 'eng');
-        const text = (res && res.data && res.data.text) ? res.data.text : '';
-        const cleaned = text.replace(/[^A-Za-z0-9]/g, '').trim();
-        return cleaned;
-    } catch (err) {
-        throw new Error(`ocr-failed: ${err.message}`);
-    }
-}
-
-async function detectSubmitResult(page) {
-    // ВАЖНО: използваме реално ВИДИМИЯ текст на страницата (innerText),
-    // а не суровия HTML markup (page.content()). Суровият HTML съдържа
-    // <script>/<style> съдържание, мета тагове, скрити елементи и т.н.,
-    // където общи думи като "грешка"/"моля" се появяват почти навсякъде
-    // (напр. в analytics скриптове, placeholder-и на самата форма още
-    // преди изобщо да е подадена) — това водеше до фалшиво "failed" за
-    // абсолютно всеки резултат, независимо какво реално се е случило.
-    const visibleText = await page.innerText('body').catch(() => '');
-    const content = visibleText.replace(/\s+/g, ' ').trim().toLowerCase();
-
-    // Само специфични, недвусмислени фрази — избягваме единични общи
-    // думи (като самотното "моля" или "грешка"), които се срещат в
-    // почти всякакъв текст по сайтовете, независимо от резултата.
-    const successPatterns = [
-        /благодарим/, /успешно изпратен/, /съобщението (ви )?е изпратено/, /запитването (ви )?е изпратено/,
-        /вашето съобщение беше изпратено/, /заявката (ви )?е получена/, /message has been sent/i, /thank you for your (message|inquiry)/i,
-    ];
-    const errorPatterns = [
-        /грешен код/, /невалиден код/, /кодът не съвпада/, /грешна captcha/i, /невалидна captcha/i,
-        /моля,? опитайте отново/, /please try again/i, /invalid captcha/i, /captcha.{0,15}(грешен|невалид|failed)/i,
-    ];
-    const url = page.url().toLowerCase();
-    const formStillVisible = await page.$('form').then(Boolean).catch(() => false);
-    const hasSuccess = successPatterns.some((re) => re.test(content)) || /thank-you|thanks-for/.test(url);
-    const hasError = errorPatterns.some((re) => re.test(content));
-    return {
-        pageTextSnippet: content.slice(0, 500),
-        isSuccess: hasSuccess,
-        isError: hasError,
-        formStillVisible,
-    };
-}
-
-async function submitContactFormWithPlaywright(url, formData = {}, captchaApiKeyLocal = null, timeoutMs = 60000) {
-    const dealerHost = new URL(url).hostname;
-    // Проследяваме какво се случи с капчата на тази страница, за да можем
-    // да логнем и върнем ясен отговор дали е минала успешно.
-    const captchaInfo = {
-        present: false,       // дали изобщо е открита капча на формата
-        type: 'none',         // 'none' | 'recaptcha' | 'image'
-        solveMethod: 'none',  // 'none' | '2captcha' | 'ocr'
-        solveAttempted: false,
-        solveValue: null,     // решението, което сме подали (текст/token) — за debug
-        passed: null,          // true/false/null(неясно) — попълва се накрая, след submit
-    };
-    let browser;
-    try {
-        browser = await playwright.chromium.launch({
-            headless: true,
-            args: [
-                '--disable-dev-shm-usage', // /dev/shm в контейнери е малък (обикновено 64MB) — тази опция кара Chrome да ползва диск вместо да гърми
-                '--disable-gpu',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-extensions',
-                '--disable-background-networking',
-            ],
-        });
-    } catch (err) {
-        log.error(`[Playwright] ${dealerHost}: НЕ успях да стартирам Chromium браузъра — ${err.message}. Най-честата причина: Docker image-ът не съдържа инсталиран Chromium (виж Dockerfile).`);
-        return { status: 'failed', submitted: false, success: false, reason: `browser-launch-failed: ${err.message}`, captcha: captchaInfo };
-    }
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Find the first form on the page
-        const formHandle = await page.$('form');
-        if (!formHandle) {
-            await browser.close();
-            return { status: 'failed', submitted: false, success: false, reason: 'no-form-found', captcha: captchaInfo };
-        }
-
-        // Collect form fields (inputs + textareas), including nearby label text.
-        const fields = await page.$$eval('form:first-of-type input, form:first-of-type textarea, form:first-of-type select', (els) => els.map((el) => {
-            const name = el.getAttribute('name');
-            const id = el.id || null;
-            const placeholder = el.getAttribute('placeholder') || '';
-            const aria = el.getAttribute('aria-label') || '';
-            const className = el.className || '';
-            let label = '';
-            if (id) {
-                const labelEl = document.querySelector(`label[for="${id}"]`);
-                if (labelEl) label = labelEl.innerText || '';
-            }
-            if (!label) {
-                let parent = el.parentElement;
-                for (let i = 0; i < 3 && parent; i += 1) {
-                    if (parent.tagName.toLowerCase() === 'label') {
-                        label = parent.innerText || '';
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-            return {
-                tag: el.tagName.toLowerCase(),
-                type: el.type || null,
-                name,
-                id,
-                placeholder,
-                aria,
-                label,
-                className,
-            };
-        }));
-
-        function matchKey(meta) {
-            if (!meta) return null;
-            const v = `${meta.name || ''} ${meta.id || ''} ${meta.placeholder || ''} ${meta.aria || ''} ${meta.label || ''} ${meta.className || ''}`.toLowerCase();
-            if (/phone|телефон|мобилен|gsm|fone|mobile/i.test(v)) return 'phone';
-            if (/name|fullname|contact|име|фирма/i.test(v)) return 'name';
-            if (/email|e-?mail|имейл|електронна|поща/i.test(v)) return 'email';
-            if (/subject|title|тема|предмет/i.test(v)) return 'subject';
-            if (/message|msg|comment|description|note|запитване|съобщение|съобщението/i.test(v)) return 'message';
-            return null;
-        }
-
-        // Check agreement boxes if present.
-        await page.$$eval('form:first-of-type input[type=checkbox]', (els) => {
-            els.forEach((checkbox) => {
-                if (!checkbox.checked) checkbox.click();
-            });
-        }).catch(() => null);
-
-        // Fill fields using heuristics
-        for (const meta of fields) {
-            const key = matchKey(meta);
-            if (!key) continue;
-            const value = formData[key];
-            if (!value) continue;
-            const selectorParts = [];
-            if (meta.name) selectorParts.push(`input[name="${meta.name}"]`, `textarea[name="${meta.name}"]`, `select[name="${meta.name}"]`);
-            if (meta.id) selectorParts.push(`#${meta.id}`);
-            if (meta.placeholder) selectorParts.push(`input[placeholder="${meta.placeholder}"]`, `textarea[placeholder="${meta.placeholder}"]`);
-            const selector = selectorParts.join(', ');
-            try {
-                if (meta.tag === 'select') {
-                    await page.selectOption(selector, value.toString());
-                } else {
-                    await page.fill(selector, value.toString());
-                }
-            } catch {
-                // best-effort; ignore fill errors
-            }
-        }
-
-        // Detect reCAPTCHA sitekey
-        const sitekey = await page.$eval('[data-sitekey], .g-recaptcha', (el) => el.getAttribute('data-sitekey'),).catch(() => null);
-        let captchaToken = null;
-        if (sitekey) {
-            captchaInfo.present = true;
-            captchaInfo.type = 'recaptcha';
-            if (!captchaApiKeyLocal) {
-                log.warning(`[Captcha] ${dealerHost}: открита reCAPTCHA, но няма зададен API ключ — прескачам.`);
-                await browser.close();
-                return { status: 'failed', submitted: false, success: false, reason: 'captcha-present-no-api-key', captcha: captchaInfo };
-            }
-            captchaInfo.solveMethod = '2captcha';
-            captchaInfo.solveAttempted = true;
-            try {
-                captchaToken = await solveRecaptcha2(sitekey, page.url(), captchaApiKeyLocal, Math.min(120000, timeoutMs));
-                captchaInfo.solveValue = captchaToken ? `${captchaToken.slice(0, 12)}…` : null;
-                log.info(`[Captcha] ${dealerHost}: reCAPTCHA решена през 2captcha, token получен.`);
-                await page.evaluate((token) => {
-                    let textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
-                    if (!textarea) {
-                        textarea = document.createElement('textarea');
-                        textarea.name = 'g-recaptcha-response';
-                        textarea.style.display = 'none';
-                        document.body.appendChild(textarea);
-                    }
-                    textarea.value = token;
-                }, captchaToken);
-            } catch (err) {
-                log.warning(`[Captcha] ${dealerHost}: решаването на reCAPTCHA се провали — ${err.message}`);
-                await browser.close();
-                return { status: 'failed', submitted: false, success: false, reason: `captcha-solve-failed: ${err.message}`, captcha: captchaInfo };
-            }
-        }
-
-        // Detect image-based captcha (simple distorted text image)
-        const imgHandle = await page.$('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
-        if (imgHandle) {
-            captchaInfo.present = true;
-            captchaInfo.type = 'image';
-            try {
-                const src = await imgHandle.getAttribute('src');
-                const absolute = new URL(src, page.url()).toString();
-                const ab = await fetch(absolute).then((r) => r.arrayBuffer());
-                const base64 = Buffer.from(ab).toString('base64');
-                let solved = null;
-                if (captchaApiKeyLocal) {
-                    captchaInfo.solveMethod = '2captcha';
-                    captchaInfo.solveAttempted = true;
-                    solved = await solveImageCaptcha2(base64, captchaApiKeyLocal, Math.min(120000, timeoutMs));
-                    captchaInfo.solveValue = solved || null;
-                    log.info(`[Captcha] ${dealerHost}: картинна капча решена през 2captcha -> "${solved}"`);
-                } else {
-                    // Try OCR fallback using Tesseract
-                    captchaInfo.solveMethod = 'ocr';
-                    captchaInfo.solveAttempted = true;
-                    try {
-                        solved = await solveImageCaptchaOCR(base64);
-                        captchaInfo.solveValue = solved || null;
-                        log.info(`[Captcha] ${dealerHost}: OCR (безплатно) прочете картинната капча като "${solved || '(празно)'}"`);
-                    } catch (ocrErr) {
-                        log.warning(`[Captcha] ${dealerHost}: OCR не успя да прочете капчата — ${ocrErr.message}`);
-                        await browser.close();
-                        return { status: 'failed', submitted: false, success: false, reason: `image-captcha-ocr-failed: ${ocrErr.message}`, captcha: captchaInfo };
-                    }
-                    if (!solved) {
-                        log.warning(`[Captcha] ${dealerHost}: OCR върна празен резултат — прескачам дилъра.`);
-                        await browser.close();
-                        return { status: 'failed', submitted: false, success: false, reason: 'image-captcha-present-no-api-key-or-ocr-empty', captcha: captchaInfo };
-                    }
-                    if (solved.length > 12) {
-                        // Капчите на mobile.bg обикновено са ~6 символа. OCR резултат,
-                        // много по-дълъг от това, почти сигурно означава, че OCR-ът е
-                        // разчел и шума на фона като допълнителни "букви" — резултатът
-                        // е боклук и подаването му само ще похаби опит без шанс за успех.
-                        log.warning(`[Captcha] ${dealerHost}: OCR резултатът изглежда невалиден (твърде дълъг: "${solved}") — вероятно е разчел шума на фона, не реалния текст. Прескачам без да пробвам да го подам.`);
-                        await browser.close();
-                        return { status: 'failed', submitted: false, success: false, reason: 'image-captcha-ocr-garbage-result', captcha: captchaInfo };
-                    }
-                }
-
-                // Try to find input for the captcha code and fill it
-                const inputSelector = await page.$eval('input[name*="code"], input[name*="captcha"], input[placeholder*="код"], input[id*="code"], input[id*="captcha"]', (el) => el.getAttribute('name') || el.id || null).catch(() => null);
-                // Optionally save captcha image and solution for debugging
-                if (debugSaveCaptcha) {
-                    try {
-                        await fs.mkdir('captchas', { recursive: true });
-                        const host = new URL(page.url()).hostname.replace(/[^a-z0-9.-]/gi, '_');
-                        const stamp = Date.now();
-                        const imgPath = `captchas/${host}-${stamp}.png`;
-                        await fs.writeFile(imgPath, Buffer.from(base64, 'base64'));
-                        await fs.writeFile(`${imgPath}.txt`, solved.toString(), 'utf8');
-                    } catch (e) {
-                        // ignore save errors
-                    }
-                }
-
-                if (inputSelector) {
-                    const sel = inputSelector.includes(' ') || inputSelector.includes('#') ? `[name="${inputSelector}"]` : `input[name="${inputSelector}"]`;
-                    try { await page.fill(sel, solved.toString()); } catch {}
-                } else {
-                    await page.evaluate((val) => {
-                        const img = document.querySelector('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], img[alt*="captcha"], img[title*="captcha"]');
-                        if (!img) return;
-                        const input = img.parentElement.querySelector('input') || document.querySelector('input');
-                        if (input) input.value = val;
-                    }, solved.toString());
-                }
-            } catch (err) {
-                log.warning(`[Captcha] ${dealerHost}: грешка при обработка на картинната капча — ${err.message}`);
-                await browser.close();
-                return { status: 'failed', submitted: false, success: false, reason: `image-captcha-solve-failed: ${err.message}`, captcha: captchaInfo };
-            }
-        }
-
-        // Submit the form: try visible submit controls first, then fallback to JS-triggering buttons or form.submit().
-        let clicked = false;
-        clicked = await page.$eval('form:first-of-type button[type="submit"], form:first-of-type input[type="submit"]', (el) => { el.click(); return true; }).catch(() => false);
-        if (!clicked) {
-            clicked = await page.$eval('form:first-of-type .addButton, form:first-of-type [onclick*="submit"], form:first-of-type [type="button"]', (el) => { el.click(); return true; }).catch(() => false);
-        }
-        if (!clicked) {
-            clicked = await page.$eval('form:first-of-type', (f) => {
-                try { f.submit(); return true; } catch { return false; }
-            }).catch(() => false);
-        }
-
-        // Wait for navigation or a short delay
-        try {
-            await Promise.race([
-                page.waitForNavigation({ timeout: 5000 }).catch(() => null),
-                new Promise((r) => setTimeout(r, 3000)),
-            ]);
-        } catch {}
-
-        const submitResult = await detectSubmitResult(page);
-        const finalUrl = page.url();
-        await browser.close();
-
-        const success = submitResult.isSuccess && !submitResult.isError;
-        const error = submitResult.isError && !submitResult.isSuccess;
-
-        // status е ясният, недвусмислен резултат:
-        //  - 'sent'            -> бутонът е кликнат И сайтът потвърди успех (изпратено наистина)
-        //  - 'failed'          -> бутонът НЕ е кликнат, ИЛИ сайтът показа съобщение за грешка
-        //  - 'unknown-clicked' -> бутонът е кликнат, но не открихме нито ясно потвърждение,
-        //                         нито ясна грешка на страницата (провери "confirmationSnippet"
-        //                         ръчно за такива редове — вероятно формата все пак е стигнала,
-        //                         но сайтът не показва разпознат от нас текст за успех)
-        let status;
-        if (!clicked) {
-            status = 'failed';
-        } else if (success) {
-            status = 'sent';
-        } else if (error) {
-            status = 'failed';
-        } else {
-            status = 'unknown-clicked';
-        }
-
-        const statusLabel = status === 'sent' ? 'ИЗПРАТЕНО' : status === 'failed' ? 'НЕУСПЕШНО' : 'НЕЯСНО';
-        log.info(`[Форма] ${dealerHost}: резултат=${statusLabel} | текст от страницата: "${submitResult.pageTextSnippet.slice(0, 200)}${submitResult.pageTextSnippet.length > 200 ? '…' : ''}"`);
-
-        // Определяме дали капчата реално е минала, въз основа на финалния
-        // резултат от страницата (само ако изобщо е имало капча за тази форма).
-        if (captchaInfo.present) {
-            const captchaErrorHints = /captcha|грешен код|невалиден код|код за потвърждение/i.test(submitResult.pageTextSnippet);
-            if (status === 'sent') {
-                captchaInfo.passed = true;
-            } else if (captchaErrorHints) {
-                captchaInfo.passed = false;
-            } else {
-                captchaInfo.passed = null; // неясно — кликнато е, но не е сигурно дали капчата е причината
-            }
-
-            const passedLabel = captchaInfo.passed === true ? 'МИНА успешно' : captchaInfo.passed === false ? 'НЕ мина (грешен код)' : 'неясно';
-            log.info(`[Captcha] ${dealerHost}: тип=${captchaInfo.type}, метод=${captchaInfo.solveMethod}, резултат=${passedLabel}`);
-        }
-
-        return {
-            status,
-            submitted: !!clicked, // само дали бутонът е бил натиснат — НЕ означава че е стигнало
-            success,              // true само ако сайтът реално потвърди изпращане
-            error,
-            captchaToken: captchaToken || null,
-            captcha: captchaInfo, // { present, type, solveMethod, solveAttempted, solveValue, passed }
-            finalUrl,
-            confirmationSnippet: submitResult.pageTextSnippet,
-            reason: !clicked ? 'submit-action-failed' : (status === 'unknown-clicked' ? 'no-clear-confirmation-on-page' : undefined),
+        const result = {
+            dealerUrl,
+            runAt: new Date().toISOString(),
+            mode: input.sendMessages ? 'send' : 'dry_run',
         };
-    } catch (err) {
-        await browser.close();
-        return { status: 'failed', submitted: false, success: false, reason: err.message, captcha: captchaInfo };
-    }
-}
 
-// Прост concurrency limiter, за да не заливаме десетки различни външни сайтове наведнъж.
-async function runWithConcurrency(items, limit, worker) {
-    const queue = [...items];
-    const runners = Array.from({ length: Math.max(1, limit) }, async () => {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            await worker(item);
-        }
-    });
-    await Promise.all(runners);
-}
-
-if (findOfficialWebsite && scrapeEmails) {
-    const dealersWithWebsite = dealerResults.filter((d) => d.officialWebsite);
-    log.info(`ФАЗА 4: Извличане на имейли от ${dealersWithWebsite.length} официални уебсайта…`);
-
-    await runWithConcurrency(dealersWithWebsite, 5, async (dealer) => {
-        const homeHtml = await fetchHtml(dealer.officialWebsite);
-        let emails = extractEmailsFromHtml(homeHtml);
-
-        if (emails.length === 0) {
-            const contactUrl = await findContactPageUrl(dealer.officialWebsite, homeHtml);
-            if (contactUrl) {
-                const contactHtml = await fetchHtml(contactUrl);
-                emails = extractEmailsFromHtml(contactHtml);
-            }
-        }
-
-        dealer.emails = emails;
-    });
-
-    const foundEmails = dealerResults.filter((d) => d.emails.length > 0).length;
-    log.info(`Намерени имейли за ${foundEmails} дилъра.`);
-}
-
-// ---------------------------------------------------------------------------
-// Optional Phase: submit contact forms on the dealers' contact pages
-// ---------------------------------------------------------------------------
-if (submitContactForm && dealerResults.length > 0 && (mode === 'send' || mode === 'both')) {
-    let targets = dealerResults;
-
-    if (skipAlreadyContacted && contactedUrls.size > 0) {
-        const alreadyContacted = dealerResults.filter((d) => contactedUrls.has(d.dealerUrl));
-        alreadyContacted.forEach((d) => {
-            d.contactForm = { submitted: false, reason: 'already-contacted-previous-run' };
-        });
-        targets = dealerResults.filter((d) => !contactedUrls.has(d.dealerUrl));
-        if (alreadyContacted.length > 0) {
-            log.info(`Прескочени ${alreadyContacted.length} дилъра, на които вече е изпратено запитване в предходен run.`);
-        }
-    }
-
-    log.info(`ФАЗА: Попълване на контактни форми за ${targets.length} дилъра (максимум ${maxBrowserConcurrency} браузъра едновременно)…`);
-
-    await runWithConcurrency(targets, Math.max(1, maxBrowserConcurrency), async (dealer) => {
         try {
-            const res = await submitContactFormWithPlaywright(dealer.contactsUrl, contactFormData, captchaApiKey, formSubmitTimeoutMs);
-            dealer.contactForm = res;
-            if (res && res.status === 'sent') {
-                contactedUrls.add(dealer.dealerUrl);
+            const identity = await readDealerIdentity(page, dealerUrl);
+            Object.assign(result, identity);
+
+            if (identity.phone && state.sentPhones[identity.phone]) {
+                result.status = 'skipped_duplicate_phone';
+                result.duplicateOf = state.sentPhones[identity.phone];
+                state.processedDealers[dealerUrl] = {
+                    status: result.status,
+                    phone: identity.phone,
+                    processedAt: result.runAt,
+                };
+                await Actor.pushData(result);
+                await store.setValue('STATE', { ...state, updatedAt: new Date().toISOString() });
+                continue;
             }
-        } catch (err) {
-            log.error(`[Contact form] Неочаквана грешка за ${dealer.dealerUrl}: ${err.message}`);
-            dealer.contactForm = { status: 'failed', submitted: false, success: false, reason: err.message };
+
+            if (!input.sendMessages) {
+                result.status = 'dry_run_ready';
+                await Actor.pushData(result);
+                if (scannedThisRun >= allowance) break;
+                continue;
+            }
+
+            const submitted = await submitDealerForm(page, input);
+            result.status = submitted.success ? 'sent' : submitted.reason;
+            result.captchaAttempts = submitted.attempts || input.maxCaptchaAttempts;
+
+            if (submitted.success) {
+                successfulThisRun += 1;
+                state.daily[today].successful += 1;
+                state.processedDealers[dealerUrl] = {
+                    status: 'sent',
+                    dealerName: identity.dealerName,
+                    phone: identity.phone,
+                    processedAt: result.runAt,
+                };
+                if (identity.phone) state.sentPhones[identity.phone] = dealerUrl;
+            }
+            await Actor.pushData(result);
+            await store.setValue('STATE', { ...state, updatedAt: new Date().toISOString() });
+        } catch (error) {
+            result.status = 'failed';
+            result.error = redactError(error);
+            await Actor.pushData(result);
+            log.error(`Dealer failed: ${dealerUrl}`, { error: result.error });
         }
-    });
 
-    const sentCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'sent').length;
-    const unknownCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'unknown-clicked').length;
-    const failedCount = targets.filter((d) => d.contactForm && d.contactForm.status === 'failed').length;
-    log.info(`Резултат от изпращането: ${sentCount} реално изпратени (потвърдени), ${unknownCount} неясни (бутонът е кликнат, но няма ясно потвърждение — провери "confirmationSnippet"), ${failedCount} неуспешни.`);
-
-    const withCaptcha = targets.filter((d) => d.contactForm && d.contactForm.captcha && d.contactForm.captcha.present);
-    if (withCaptcha.length > 0) {
-        const captchaPassed = withCaptcha.filter((d) => d.contactForm.captcha.passed === true).length;
-        const captchaFailed = withCaptcha.filter((d) => d.contactForm.captcha.passed === false).length;
-        const captchaUnknown = withCaptcha.filter((d) => d.contactForm.captcha.passed === null).length;
-        log.info(`Капчи: ${withCaptcha.length} дилъра имаха капча -> ${captchaPassed} минати успешно, ${captchaFailed} неуспешни, ${captchaUnknown} неясни.`);
+        if (successfulThisRun < allowance) await sleep(input.delayBetweenDealersMs);
     }
-
-    // Записваме обновения списък с контактувани дилъри за следващи run-ове.
-    await contactedStore.setValue('contactedUrls', [...contactedUrls]);
+} finally {
+    state.updatedAt = new Date().toISOString();
+    await store.setValue('STATE', state);
+    await browser.close();
 }
 
-/**
- * ---------------------------------------------------------------------------
- * Финално записване в Dataset.
- * ---------------------------------------------------------------------------
- */
-await Actor.pushData(dealerResults);
-
-log.info('Готово.');
-
+const output = {
+    today,
+    sendMessages: input.sendMessages,
+    successfulThisRun,
+    successfulToday: state.daily[today].successful,
+    scannedThisRun,
+    remainingToday: remainingDailyAllowance(state, today, input.dailySuccessfulLimit),
+    stateStoreName: input.stateStoreName,
+};
+await Actor.setValue('OUTPUT', output);
+log.info('Run finished', output);
 await Actor.exit();
